@@ -1,0 +1,50 @@
+/**
+ * PermRAG authorization schema.
+ *
+ * Design notes:
+ *  - `user` is a bare subject type; identity itself lives in Postgres.
+ *  - A `document` has exactly one owning department, plus optional
+ *    cross-department shares and per-person overrides.
+ *  - `view` is the single permission the retrieval path ever checks.
+ *    Everything else in this file exists to compute it.
+ */
+
+definition user {}
+
+definition department {
+    /** Direct members of this department. */
+    relation member: user
+
+    /** Users who administer this department (implies membership). */
+    relation manager: user
+
+    permission membership = member + manager
+    permission manage = manager
+}
+
+definition document {
+    /** The single department that owns this document. */
+    relation owner_department: department
+
+    /** Departments explicitly granted cross-department access. */
+    relation shared_department: department
+
+    /** Individual users granted a person-level override. */
+    relation viewer: user
+
+    /**
+     * The only permission consulted at retrieval time.
+     *
+     * True when the subject is:
+     *   - a member of the owning department, OR
+     *   - a member of a department that was granted a cross-department share, OR
+     *   - the holder of a direct person-level override.
+     */
+
+    permission view = viewer
+                    + owner_department->membership
+                    + shared_department->membership
+
+    /** Who may re-share or delete the document. */
+    permission administer = owner_department->manage
+}
