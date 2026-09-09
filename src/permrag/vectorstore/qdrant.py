@@ -87,7 +87,7 @@ class QdrantVectorStore:
                         distance=models.Distance.COSINE,
                     ),
                 )
-                logger.info("qdrant collection created", extra={"name": self._collection})
+                logger.info("qdrant collection created", extra={"collection": self._collection})
 
             # Keyword indexes on the filtered fields. Without these, Qdrant
             # scans payloads instead of using the index, and filtered search
