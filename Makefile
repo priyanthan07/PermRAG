@@ -6,8 +6,8 @@ help:
 install: ## Install dependencies with uv
 	uv sync --all-extras
 
-up: ## Start Postgres, SpiceDB and Qdrant
-	docker compose up -d postgres spicedb qdrant
+up: ## Start SpiceDB and Qdrant
+	docker compose up -d spicedb qdrant
 
 down: ## Stop all containers (volumes survive)
 	docker compose down
@@ -38,7 +38,7 @@ clean: ## Remove caches
 
 reset: ## DESTRUCTIVE: wipe all data volumes and start over
 	docker compose down -v
-	docker compose up -d postgres spicedb qdrant
+	docker compose up -d spicedb qdrant
 	@echo "Waiting for services..." && sleep 12
 	$(MAKE) migrate
 	$(MAKE) bootstrap

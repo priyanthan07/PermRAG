@@ -10,7 +10,7 @@ services:
       - migrate
       - head
       - --datastore-engine=postgres
-      - --datastore-conn-uri=postgres://${POSTGRES_USER:-permrag}:${POSTGRES_PASSWORD:-permrag}@postgres:5432/${SPICEDB_DB:-spicedb}?sslmode=disable
+      - --datastore-conn-uri=postgres://${POSTGRES_USER:-permrag}:${POSTGRES_PASSWORD:-permrag}@${POSTGRES_HOST:-localhost}:${POSTGRES_PORT:-5432}/${SPICEDB_DB:-spicedb}?sslmode=${POSTGRES_SSL_MODE:-disable}
     restart: on-failure
 
   spicedb:
@@ -21,7 +21,7 @@ services:
       - serve
       - --grpc-preshared-key=${SPICEDB_TOKEN:-permrag-local-dev-key}
       - --datastore-engine=postgres
-      - --datastore-conn-uri=postgres://${POSTGRES_USER:-permrag}:${POSTGRES_PASSWORD:-permrag}@postgres:5432/${SPICEDB_DB:-spicedb}?sslmode=disable
+      - --datastore-conn-uri=postgres://${POSTGRES_USER:-permrag}:${POSTGRES_PASSWORD:-permrag}@${POSTGRES_HOST:-localhost}:${POSTGRES_PORT:-5432}/${SPICEDB_DB:-spicedb}?sslmode=${POSTGRES_SSL_MODE:-disable}
       - --http-enabled
     ports:
       - "${SPICEDB_GRPC_PORT:-50051}:50051"
@@ -51,7 +51,6 @@ services:
     env_file:
       - .env
     environment:
-      POSTGRES_HOST: postgres
       SPICEDB_ENDPOINT: spicedb:50051
       QDRANT_URL: http://qdrant:6333
     ports:
