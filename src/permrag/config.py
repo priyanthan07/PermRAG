@@ -24,8 +24,12 @@ class Settings(BaseSettings):
     postgres_password: SecretStr = SecretStr("permrag")
     postgres_db: str = "permrag"
     spicedb_db: str = "spicedb"
+    
     db_pool_size: int = 10
     db_max_overflow: int = 5
+    postgres_ssl_mode: Literal[
+        "disable", "allow", "prefer", "require", "verify-ca", "verify-full"
+    ] = "disable"
     
     # --- SpiceDB ---
     spicedb_endpoint: str = "localhost:50051"
@@ -79,6 +83,7 @@ class Settings(BaseSettings):
                 host=self.postgres_host,
                 port=self.postgres_port,
                 path=self.postgres_db,
+                query=f"ssl={self.postgres_ssl_mode}",
             )
         )
         
@@ -94,6 +99,7 @@ class Settings(BaseSettings):
                 host=self.postgres_host,
                 port=self.postgres_port,
                 path=self.postgres_db,
+                query=f"sslmode={self.postgres_ssl_mode}",
             )
         )
     

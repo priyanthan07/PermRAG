@@ -1,25 +1,6 @@
 name: permrag
 
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: permrag-postgres
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:-permrag}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-permrag}
-      POSTGRES_DB: ${POSTGRES_DB:-permrag}
-    ports:
-      - "${POSTGRES_PORT:-5432}:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./scripts/init_databases.sh:/docker-entrypoint-initdb.d/10-init-databases.sh:ro
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-permrag} -d ${POSTGRES_DB:-permrag}"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
   # Applies SpiceDB's own table migrations, then exits. SpiceDB refuses
   # to start against an unmigrated datastore, so this must succeed first.
   spicedb-migrate:
@@ -30,10 +11,6 @@ services:
       - head
       - --datastore-engine=postgres
       - --datastore-conn-uri=postgres://${POSTGRES_USER:-permrag}:${POSTGRES_PASSWORD:-permrag}@postgres:5432/${SPICEDB_DB:-spicedb}?sslmode=disable
-
-    depends_on:
-      postgres:
-        condition: service_healthy
     restart: on-failure
 
   spicedb:
@@ -80,8 +57,6 @@ services:
     ports:
       - "${API_PORT:-8000}:8000"
     depends_on:
-      postgres:
-        condition: service_healthy
       spicedb:
         condition: service_started
       qdrant:
