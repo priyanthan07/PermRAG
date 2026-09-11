@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from permrag.db.models import QueryLog
-from permrag.llm.openai_client import generate_answer
+from permrag.llm import generate_answer
 from permrag.observability.langfuse_client import get_langfuse, get_trace_id
 from permrag.rag.retriever import PermissionAwareRetriever
 from permrag.vectorstore.qdrant import SearchHit

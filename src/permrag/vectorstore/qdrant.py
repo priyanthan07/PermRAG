@@ -66,7 +66,7 @@ class QdrantVectorStore:
         api_key = settings.qdrant_api_key.get_secret_value() if settings.qdrant_api_key else None
         self._client = AsyncQdrantClient(url=settings.qdrant_url, api_key=api_key or None, timeout=30)
         self._collection = settings.qdrant_collection
-        self._dimensions = settings.openai_embedding_dimensions
+        self._dimensions = settings.embedding_dimensions
         logger.info("qdrant client initialised",extra={"url": settings.qdrant_url, "collection": self._collection})
     
     @property

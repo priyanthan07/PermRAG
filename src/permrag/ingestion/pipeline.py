@@ -10,7 +10,7 @@ from permrag.config import get_settings
 from permrag.db.models import Document, DocumentPage
 from permrag.exceptions import NotFoundError, ValidationError
 from permrag.ingestion.chunker import chunk_page, hash_content
-from permrag.llm.openai_client import embed_texts
+from permrag.llm import embed_texts
 from permrag.permissions.service import PermissionService
 from permrag.vectorstore.qdrant import ChunkPayload, QdrantVectorStore, build_chunk_id
 

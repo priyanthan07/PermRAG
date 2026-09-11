@@ -14,7 +14,7 @@ from dataclasses import dataclass
 
 from permrag.config import get_settings
 from permrag.exceptions import PermissionSystemError
-from permrag.llm.openai_client import embed_query
+from permrag.llm import embed_query
 from permrag.observability.langfuse_client import get_langfuse
 from permrag.permissions.service import PermissionService
 from permrag.vectorstore.qdrant import QdrantVectorStore, SearchHit
