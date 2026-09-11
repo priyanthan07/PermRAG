@@ -10,7 +10,7 @@ services:
       - migrate
       - head
       - --datastore-engine=postgres
-      - --datastore-conn-uri=postgres://${POSTGRES_USER:-permrag}:${POSTGRES_PASSWORD:-permrag}@${POSTGRES_HOST:-localhost}:${POSTGRES_PORT:-5432}/${SPICEDB_DB:-spicedb}?sslmode=${POSTGRES_SSL_MODE:-disable}
+      - --datastore-conn-uri=postgres://${SPICEDB_POSTGRES_USER:-permrag}:${SPICEDB_POSTGRES_PASSWORD:-permrag}@${SPICEDB_POSTGRES_HOST:-localhost}:${SPICEDB_POSTGRES_PORT:-5432}/${SPICEDB_DB:-spicedb}?sslmode=${POSTGRES_SSL_MODE:-disable}
     restart: on-failure
 
   spicedb:
@@ -21,7 +21,7 @@ services:
       - serve
       - --grpc-preshared-key=${SPICEDB_TOKEN:-permrag-local-dev-key}
       - --datastore-engine=postgres
-      - --datastore-conn-uri=postgres://${POSTGRES_USER:-permrag}:${POSTGRES_PASSWORD:-permrag}@${POSTGRES_HOST:-localhost}:${POSTGRES_PORT:-5432}/${SPICEDB_DB:-spicedb}?sslmode=${POSTGRES_SSL_MODE:-disable}
+      - --datastore-conn-uri=postgres://${SPICEDB_POSTGRES_USER:-permrag}:${SPICEDB_POSTGRES_PASSWORD:-permrag}@${SPICEDB_POSTGRES_HOST:-localhost}:${SPICEDB_POSTGRES_PORT:-5432}/${SPICEDB_DB:-spicedb}?sslmode=${POSTGRES_SSL_MODE:-disable}
       - --http-enabled
     ports:
       - "${SPICEDB_GRPC_PORT:-50051}:50051"
@@ -63,5 +63,4 @@ services:
     profiles: ["full"]
     
 volumes:
-  postgres_data:
   qdrant_data:

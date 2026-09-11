@@ -41,9 +41,7 @@ definition document {
      *   - the holder of a direct person-level override.
      */
 
-    permission view = viewer
-                    + owner_department->membership
-                    + shared_department->membership
+    permission view = viewer + owner_department->membership + shared_department->membership
 
     /** Who may re-share or delete the document. */
     permission administer = owner_department->manage

@@ -46,7 +46,7 @@ async def ensure_admin_user() -> None:
     email = settings.bootstrap_admin_email.lower()
     password = settings.bootstrap_admin_password.get_secret_value()
 
-    if password == "change-me":
+    if password == "admin":
         logger.warning(
             "bootstrap admin is using the default password; change it before "
             "exposing this service"

@@ -41,13 +41,26 @@ class Settings(BaseSettings):
     qdrant_api_key: SecretStr | None = None
     qdrant_collection: str = "permrag_chunks"
     
+    # --- LLM provider ---
+    # Which backend serves embeddings and answer generation. Only the chosen
+    # provider's credentials need to be present.
+    llm_provider: Literal["openai", "gemini"] = "openai"
+    llm_timeout_seconds: float = 60.0
+    
     # --- OpenAI ---
-    openai_api_key: SecretStr
+    openai_api_key: SecretStr | None = None
     openai_chat_model: str = "gpt-4o-mini"
     openai_embedding_model: str = "text-embedding-3-small"
     openai_embedding_dimensions: int = 1536
     openai_timeout_seconds: float = 60.0
     openai_max_retries: int = 3
+    
+    # --- Gemini ---
+    gemini_api_key: SecretStr | None = None
+    gemini_chat_model: str = "gemini-3.6-flash"
+    gemini_embedding_model: str = "gemini-embedding-001"
+    gemini_embedding_dimensions: int = 3072
+    gemini_thinking_level: Literal["LOW", "MEDIUM", "HIGH"] | None = "LOW"
     
     # --- Langfuse ---
     langfuse_public_key: SecretStr | None = None
@@ -102,6 +115,20 @@ class Settings(BaseSettings):
                 query=f"sslmode={self.postgres_ssl_mode}",
             )
         )
+    
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def embedding_dimensions(self) -> int:
+        """
+            Vector width for the active provider.
+    
+            The Qdrant collection is sized from this. Changing provider or model
+            changes the width, and an existing collection is never resized in
+            place -- it has to be dropped and rebuilt.
+        """
+        if self.llm_provider == "gemini":
+            return self.gemini_embedding_dimensions
+        return self.openai_embedding_dimensions
     
     @computed_field  # type: ignore[prop-decorator]
     @property
