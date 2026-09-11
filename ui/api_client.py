@@ -1,10 +1,3 @@
-"""Thin HTTP client for the PermRAG API.
-
-Every method here maps to exactly one endpoint in src/permrag/api/routers/.
-Keeping the HTTP details in one place means the Streamlit layer only ever
-deals with plain dicts and a single error type.
-"""
-
 from __future__ import annotations
 
 from typing import Any

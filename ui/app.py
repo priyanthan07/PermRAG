@@ -1,17 +1,7 @@
-"""Streamlit console for PermRAG.
-
-Run with:
-    uv run streamlit run ui/app.py
-
-This talks to the FastAPI service over HTTP exactly the way any other client
-would -- it holds no database, SpiceDB, or Qdrant connection of its own. That
-matters: every permission decision shown here was made by the API, not by the
-UI, so what you see is genuinely what the permission system returned.
-"""
-
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -20,6 +10,13 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from api_client import APIError, PermRAGClient  # noqa: E402
+from file_parser import (  # noqa: E402
+    SUPPORTED_EXTENSIONS,
+    EmptyDocument,
+    UnsupportedFileType,
+    parse_file,
+)
+from file_parser import _paginate as paginate_text  # noqa: E402
 
 DEFAULT_API_URL = os.getenv("PERMRAG_API_URL", "http://localhost:8000")
 
@@ -432,10 +429,36 @@ def render_users() -> None:
 # --- ingest (admin) ----------------------------------------------------------
 
 
+def _slugify(filename: str) -> str:
+    """Derive a stable external_id from a filename.
+
+    Stable matters: re-uploading the same file must produce the same id so the
+    API treats it as an update and skips unchanged pages, rather than creating
+    a duplicate document.
+    """
+    stem = filename.rsplit(".", 1)[0]
+    slug = re.sub(r"[^a-z0-9]+", "-", stem.lower()).strip("-")
+    return slug or "document"
+
+
+def _titleize(filename: str) -> str:
+    stem = filename.rsplit(".", 1)[0]
+    return re.sub(r"[_-]+", " ", stem).strip().title() or filename
+
+
+def _show_ingest_result(result: dict) -> None:
+    cols = st.columns(5)
+    cols[0].metric("Pages total", result["pages_total"])
+    cols[1].metric("Indexed", result["pages_indexed"])
+    cols[2].metric("Skipped", result["pages_skipped"])
+    cols[3].metric("Removed", result["pages_removed"])
+    cols[4].metric("Chunks written", result["chunks_written"])
+
+
 def render_ingest() -> None:
-    st.header("Ingest a document")
+    st.header("Ingest documents")
     st.caption(
-        "Re-posting the same external ID performs an incremental update: pages whose "
+        "Re-uploading the same document performs an incremental update: pages whose "
         "content hash is unchanged are skipped without spending an embedding call."
     )
 
@@ -449,68 +472,154 @@ def render_ingest() -> None:
         st.warning("Create a department first -- every document needs an owning department.")
         return
 
-    external_id = st.text_input("External ID", placeholder="handbook-001")
-    title = st.text_input("Title", placeholder="Engineering Handbook")
-    department = st.selectbox(
-        "Owning department", departments, format_func=label_for_department, key="ingest_dept"
+    tab_upload, tab_paste = st.tabs(["Upload files", "Paste text"])
+
+    with tab_upload:
+        _render_upload_tab(departments)
+
+    with tab_paste:
+        _render_paste_tab(departments)
+
+
+def _render_upload_tab(departments: list[dict]) -> None:
+    st.caption(
+        f"Supported: {', '.join(SUPPORTED_EXTENSIONS)}. Each file becomes its own "
+        "document. PDFs keep their real page numbers; slides and worksheets map to "
+        "one page each; formats without pages are split into even blocks."
     )
-    source_uri = st.text_input("Source URI (optional)")
 
-    st.markdown("**Pages**")
-    mode = st.radio(
-        "Input mode",
-        ["Paste text", "Upload .txt files"],
-        horizontal=True,
-        label_visibility="collapsed",
-    )
-
-    pages: list[dict] = []
-
-    if mode == "Paste text":
-        page_count = st.number_input("Number of pages", min_value=1, max_value=50, value=1)
-        for index in range(int(page_count)):
-            content = st.text_area(f"Page {index + 1}", key=f"page_{index}", height=140)
-            if content.strip():
-                pages.append({"page_number": index + 1, "content": content})
-    else:
+    # Everything sits inside a form so Streamlit does not re-run the whole
+    # script (and re-parse every file) on each keystroke. Nothing is sent
+    # until the submit button is pressed.
+    with st.form("ingest_upload", clear_on_submit=False):
         uploads = st.file_uploader(
-            "One file per page, ordered by filename",
-            type=["txt", "md"],
+            "Drop files here",
+            type=SUPPORTED_EXTENSIONS,
             accept_multiple_files=True,
         )
-        for index, upload in enumerate(uploads or []):
-            text = upload.read().decode("utf-8", errors="replace")
-            if text.strip():
-                pages.append({"page_number": index + 1, "content": text})
-        if pages:
-            st.caption(f"{len(pages)} page(s) ready.")
+        department = st.selectbox(
+            "Owning department", departments, format_func=label_for_department
+        )
+        submitted = st.form_submit_button("Ingest files", type="primary")
 
-    if st.button("Ingest", type="primary", disabled=not pages):
-        if not external_id.strip() or not title.strip():
-            st.warning("External ID and title are both required.")
-            return
-        with st.spinner("Chunking, embedding, and writing permissions..."):
+    if not submitted:
+        return
+
+    if not uploads:
+        st.warning("Choose at least one file first.")
+        return
+
+    succeeded = 0
+
+    for upload in uploads:
+        with st.status(f"{upload.name}", expanded=True) as status:
+            # getvalue(), not read(): the uploaded file object survives across
+            # reruns, and read() leaves the stream at EOF so a second pass
+            # would silently see an empty file.
+            data = upload.getvalue()
+
+            if not data:
+                status.update(label=f"{upload.name} -- empty file", state="error")
+                continue
+
+            try:
+                parsed = parse_file(upload.name, data)
+            except (UnsupportedFileType, EmptyDocument) as exc:
+                st.error(str(exc))
+                status.update(label=f"{upload.name} -- could not read", state="error")
+                continue
+            except Exception as exc:  # a corrupt or password-protected file
+                st.error(f"Failed to parse: {exc}")
+                status.update(label=f"{upload.name} -- parse failed", state="error")
+                continue
+
+            st.write(
+                f"Parsed **{len(parsed.pages)}** page(s) "
+                f"(1 page = 1 {parsed.page_unit}), "
+                f"{sum(len(p['content'].split()) for p in parsed.pages):,} words."
+            )
+            if parsed.note:
+                st.info(parsed.note)
+
             try:
                 result = client().ingest_document(
-                    external_id=external_id.strip(),
-                    title=title.strip(),
+                    external_id=_slugify(upload.name),
+                    title=_titleize(upload.name),
                     owner_department_id=department["id"],
-                    pages=pages,
-                    source_uri=source_uri.strip() or None,
+                    pages=parsed.pages,
+                    source_uri=upload.name,
                 )
             except APIError as exc:
-                show_error(exc)
-                return
+                st.error(f"{exc.status_code}: {exc.detail}")
+                status.update(label=f"{upload.name} -- ingest failed", state="error")
+                continue
 
+            _show_ingest_result(result)
+            succeeded += 1
+            status.update(label=f"{upload.name} -- done", state="complete")
+
+    if succeeded:
         clear_lookups()
-        st.success("Document ingested.")
-        cols = st.columns(5)
-        cols[0].metric("Pages total", result["pages_total"])
-        cols[1].metric("Indexed", result["pages_indexed"])
-        cols[2].metric("Skipped", result["pages_skipped"])
-        cols[3].metric("Removed", result["pages_removed"])
-        cols[4].metric("Chunks written", result["chunks_written"])
-        st.caption(f"document_id: `{result['document_id']}`")
+        st.success(f"Ingested {succeeded} of {len(uploads)} file(s).")
+
+
+def _render_paste_tab(departments: list[dict]) -> None:
+    st.caption(
+        "Long text is split into even pages automatically. Put a line containing "
+        "only `---` where you want an explicit page break."
+    )
+
+    with st.form("ingest_paste"):
+        external_id = st.text_input("External ID", placeholder="handbook-001")
+        title = st.text_input("Title", placeholder="Engineering Handbook")
+        department = st.selectbox(
+            "Owning department", departments, format_func=label_for_department
+        )
+        source_uri = st.text_input("Source URI (optional)")
+        body = st.text_area("Content", height=320)
+        submitted = st.form_submit_button("Ingest text", type="primary")
+
+    if not submitted:
+        return
+
+    if not external_id.strip() or not title.strip():
+        st.warning("External ID and title are both required.")
+        return
+    if not body.strip():
+        st.warning("There is no content to ingest.")
+        return
+
+    if "\n---" in body:
+        blocks = [b for b in re.split(r"^\s*---\s*$", body, flags=re.MULTILINE)]
+    else:
+        blocks = paginate_text(body)
+
+    pages = [
+        {"page_number": i + 1, "content": b.strip()}
+        for i, b in enumerate(blocks)
+        if b.strip()
+    ]
+
+    if not pages:
+        st.warning("There is no content to ingest.")
+        return
+
+    with st.spinner("Chunking, embedding, and writing permissions..."):
+        try:
+            result = client().ingest_document(
+                external_id=external_id.strip(),
+                title=title.strip(),
+                owner_department_id=department["id"],
+                pages=pages,
+                source_uri=source_uri.strip() or None,
+            )
+        except APIError as exc:
+            show_error(exc)
+            return
+
+    clear_lookups()
+    st.success(f"Document ingested as {len(pages)} page(s).")
+    _show_ingest_result(result)
 
 
 # --- sharing and access (admin) ----------------------------------------------
