@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 import grpc
 from authzed.api.v1 import (
+    Cursor,
     CheckPermissionRequest,
     CheckPermissionResponse,
     Client,
@@ -38,6 +39,9 @@ REL_MANAGER = "manager"
 REL_OWNER_DEPARTMENT = "owner_department"
 REL_SHARED_DEPARTMENT = "shared_department"
 REL_VIEWER = "viewer"
+
+# SpiceDB refuses an optional_limit above this on LookupResources.
+SPICEDB_MAX_PAGE_SIZE = 1000
 
 # Permissions
 PERM_VIEW = "view"
@@ -213,31 +217,63 @@ class SpiceDBClient:
         self,
         user_id: str,
         zed_token: str | None = None,
-        limit: int = 5000,
+        limit: int = 1000,
     ) -> tuple[list[str], str | None]:
         """Return every document id this user may view.
 
         This is the call that gates retrieval. Its result becomes the
         mandatory filter passed into the vector search.
-        """
-        request = LookupResourcesRequest(
-            consistency=self._consistency(zed_token),
-            resource_object_type=TYPE_DOCUMENT,
-            permission=PERM_VIEW,
-            subject=user_subject(user_id),
-            optional_limit=limit,
-        )
 
+        SpiceDB rejects any optional_limit above SPICEDB_MAX_PAGE_SIZE, so
+        `limit` here is the total we want, not the page size: the lookup is
+        paged with a cursor and the pages are concatenated. Without this,
+        any organisation whose users can see more than that many documents
+        would fail closed on every single query.
+        """
         document_ids: list[str] = []
         observed_token: str | None = None
+        cursor: Cursor | None = None
 
         try:
-            async for response in self._client.LookupResources(request):
-                document_ids.append(response.resource_object_id)
-                if response.looked_up_at.token:
-                    observed_token = response.looked_up_at.token
+            while len(document_ids) < limit:
+                page_size = min(SPICEDB_MAX_PAGE_SIZE, limit - len(document_ids))
+                request = LookupResourcesRequest(
+                    consistency=self._consistency(zed_token),
+                    resource_object_type=TYPE_DOCUMENT,
+                    permission=PERM_VIEW,
+                    subject=user_subject(user_id),
+                    optional_limit=page_size,
+                    optional_cursor=cursor,
+                )
+
+                received = 0
+                next_cursor: Cursor | None = None
+
+                async for response in self._client.LookupResources(request):
+                    document_ids.append(response.resource_object_id)
+                    received += 1
+                    if response.looked_up_at.token:
+                        observed_token = response.looked_up_at.token
+                    if response.HasField("after_result_cursor"):
+                        next_cursor = response.after_result_cursor
+
+                # A short page means the result set is exhausted. Checking
+                # this rather than only the cursor avoids looping forever if
+                # the server keeps returning one.
+                if received < page_size or next_cursor is None:
+                    break
+
+                cursor = next_cursor
         except grpc.RpcError as exc:
             raise PermissionSystemError(f"Permission lookup failed: {exc}") from exc
+
+        if len(document_ids) >= limit:
+            # Silently truncating would make documents invisible with no
+            # signal, which looks identical to a permission problem.
+            logger.warning(
+                "permission lookup hit the configured ceiling; results truncated",
+                extra={"user_id": user_id, "limit": limit},
+            )
 
         logger.info(
             "permission lookup complete",
