@@ -156,12 +156,11 @@ async def rerank_with_scores[T: Scoreable](
             "candidates": len(candidates),
             "kept": len(results),
             "dropped_below_floor": dropped,
-            "top_score": round(float(results[0][1]), 4),
+            "top_score": round(top_score, 4),
         },
     )
     return results
- 
- 
+
 async def rerank[T: Scoreable](query: str, candidates: Sequence[T], top_k: int) -> list[T]:
     """Top_k candidates, best first, without the scores."""
     return [candidate for candidate, _ in await rerank_with_scores(query, candidates, top_k)]

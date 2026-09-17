@@ -91,6 +91,13 @@ class Settings(BaseSettings):
     reranker_min_score: float = 0.0
     reranker_threads: int = Field(default=4, ge=0, le=64)
     
+    # --- Evaluation (DeepEval) ---
+    eval_enabled: bool = True
+    eval_judge_model: str = "gemini-2.0-flash-lite"
+    eval_faithfulness_threshold: float = 0.5
+    eval_answer_relevancy_threshold: float = 0.5
+    eval_contextual_relevancy_threshold: float = 0.5
+    
     max_permitted_documents: int = Field(default=5000, ge=1)
     chunk_size_words: int = Field(default=280, ge=50)
     chunk_overlap_words: int = Field(default=50, ge=0)

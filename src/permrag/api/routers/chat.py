@@ -55,3 +55,4 @@ async def ask(
         trace_id=result.trace_id,
         latency_ms=result.latency_ms,
     )
+    
