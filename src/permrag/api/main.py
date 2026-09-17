@@ -16,8 +16,12 @@ from permrag.logging_config import configure_logging
 from permrag.observability.langfuse_client import get_langfuse, shutdown_langfuse
 from permrag.permissions.client import get_spicedb_client
 from permrag.vectorstore.qdrant import get_vector_store
+from permrag.rag.reranker import warm_reranker
 
 logger = logging.getLogger(__name__)
+
+warm_reranker()
+logger.info("reranker warm")
 
 SCHEMA_PATH = Path(__file__).resolve().parents[3] / "schema" / "permrag.zed"
 

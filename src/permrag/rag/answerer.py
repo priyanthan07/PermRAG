@@ -95,10 +95,13 @@ class Answerer:
         context, citations = build_context(retrieval.hits)
         user_prompt = f"Passages:\n\n{context}\n\nQuestion: {question}"
 
+        trace_id: str | None = None
+
         if langfuse is not None:
             with langfuse.start_as_current_observation(name="generate-answer", as_type="generation", input={"question": question}) as span:
                 answer_text, usage = await generate_answer(SYSTEM_PROMPT, user_prompt)
                 span.update(output=answer_text, usage_details=usage)
+                trace_id = get_trace_id()
         else:
             answer_text, _ = await generate_answer(SYSTEM_PROMPT, user_prompt)
 
@@ -107,7 +110,7 @@ class Answerer:
             citations=citations,
             permitted_document_count=len(retrieval.permitted_document_ids),
             retrieved_chunk_count=len(retrieval.hits),
-            trace_id=get_trace_id(),
+            trace_id=trace_id,
             latency_ms=self._elapsed_ms(started),
         )
         await self._log_query(user_id, question, retrieval, result)

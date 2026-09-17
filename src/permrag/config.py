@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     # --- Application ---
     environment: Literal["local", "staging", "production"] = "local"
     log_level: str = "INFO"
+    api_host: str = "0.0.0.0"
     api_port: int = 8000
     
     # --- Postgres ---
@@ -80,6 +81,16 @@ class Settings(BaseSettings):
     # --- Retrieval ---
     retrieval_candidate_limit: int = Field(default=40, ge=1, le=500)
     retrieval_final_limit: int = Field(default=8, ge=1, le=50)
+    
+    # --- Reranking ---
+    reranker_enabled: bool = True
+    reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+    reranker_device: str = ""
+    reranker_batch_size: int = Field(default=32, ge=1, le=256)
+    reranker_max_length: int = Field(default=512, ge=64, le=2048)
+    reranker_min_score: float = 0.0
+    reranker_threads: int = Field(default=4, ge=0, le=64)
+    
     max_permitted_documents: int = Field(default=5000, ge=1)
     chunk_size_words: int = Field(default=280, ge=50)
     chunk_overlap_words: int = Field(default=50, ge=0)

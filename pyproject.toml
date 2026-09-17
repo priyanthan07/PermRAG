@@ -30,6 +30,7 @@ dependencies = [
     "python-pptx>=1.0.2",
     "qdrant-client>=1.19.0",
     "ruff>=0.16.6",
+    "sentence-transformers>=6.0.1",
     "sqlalchemy[asyncio]>=2.0.52",
     "streamlit>=1.63.0",
     "uvicorn[standard]>=0.52.4",

@@ -27,7 +27,17 @@ def get_gemini_client() -> genai.Client:
             raise LLMError("LLM_PROVIDER is 'gemini' but GEMINI_API_KEY is not set")
         _client = genai.Client(
             api_key=settings.gemini_api_key.get_secret_value(),
-            http_options=types.HttpOptions(timeout=int(settings.llm_timeout_seconds * 1000)),
+            http_options=types.HttpOptions(
+                timeout=int(settings.llm_timeout_seconds * 1000),
+                retry_options=types.HttpRetryOptions(
+                    attempts=4,
+                    initial_delay=1.0,
+                    max_delay=16.0,
+                    exp_base=2.0,
+                    jitter=1.0,
+                    http_status_codes=[408, 429, 500, 502, 503, 504],
+                ),
+            ),
         )
         logger.info("gemini client initialised")
     return _client

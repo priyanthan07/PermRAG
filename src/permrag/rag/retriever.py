@@ -17,6 +17,7 @@ from permrag.exceptions import PermissionSystemError
 from permrag.llm import embed_query
 from permrag.observability.langfuse_client import get_langfuse
 from permrag.permissions.service import PermissionService
+from permrag.rag.reranker import rerank_with_scores
 from permrag.vectorstore.qdrant import QdrantVectorStore, SearchHit
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,7 @@ class RetrievalResult:
     permitted_document_ids: list[str]
     zed_token: str | None
     truncated: bool
+    reranked: bool = False
     
 class PermissionAwareRetriever:
     def __init__(self, vector_store: QdrantVectorStore, permissions: PermissionService) -> None:
@@ -91,9 +93,37 @@ class PermissionAwareRetriever:
                         "chunk_id": hit.chunk_id,
                     },
                 )
+                
+        # -- 4. rerank ------------------------------------------------------
+        final_limit = self._settings.retrieval_final_limit
+ 
+        if langfuse is not None:
+            with langfuse.start_as_current_observation(
+                name="rerank", as_type="span", input={"candidate_count": len(verified)}
+            ) as span:
+                scored = await rerank_with_scores(question, verified, final_limit)
+                span.update(
+                    output={
+                        "kept": len(scored),
+                        "dropped_below_floor": len(verified) - len(scored),
+                        "results": [
+                            {
+                                "title": hit.title,
+                                "page_number": hit.page_number,
+                                "embedding_score": round(hit.score, 4),
+                                "rerank_score": round(score, 4) if score is not None else None,
+                            }
+                            for hit, score in scored
+                        ],
+                    }
+                )
+        else:
+            scored = await rerank_with_scores(question, verified, final_limit)
 
-        final = verified[: self._settings.retrieval_final_limit]
-        return RetrievalResult(final, permitted_ids, zed_token, truncated)
+        final = [hit for hit, _ in scored]
+        reranked = any(score is not None for _, score in scored)
+ 
+        return RetrievalResult(final, permitted_ids, zed_token, truncated, reranked)
     
     async def _lookup(self, user_id: uuid.UUID, max_docs: int) -> tuple[list[str], str | None]:
         """Fail closed. If authorization cannot be consulted, nothing is returned."""
