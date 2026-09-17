@@ -20,9 +20,6 @@ from permrag.rag.reranker import warm_reranker
 
 logger = logging.getLogger(__name__)
 
-warm_reranker()
-logger.info("reranker warm")
-
 SCHEMA_PATH = Path(__file__).resolve().parents[3] / "schema" / "permrag.zed"
 
 @asynccontextmanager
@@ -30,6 +27,9 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     configure_logging(settings.log_level)
     logger.info("starting permrag", extra={"version": __version__})
+
+    warm_reranker()
+    logger.info("reranker warm")
 
     get_engine()
 
