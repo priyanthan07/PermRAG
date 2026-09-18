@@ -70,7 +70,19 @@ class PermissionAwareRetriever:
                     permitted_document_ids=permitted_ids,
                     limit=self._settings.retrieval_candidate_limit,
                 )
-                span.update(output={"hit_count": len(hits)})
+                span.update(
+                    output={
+                        "hit_count": len(hits),
+                        "hits": [
+                            {
+                                "title": hit.title,
+                                "page_number": hit.page_number,
+                                "embedding_score": round(hit.score, 4),
+                            }
+                            for hit in hits
+                        ],
+                    }
+                )
         else:
             hits = await self._store.search(
                 query_vector=query_vector,

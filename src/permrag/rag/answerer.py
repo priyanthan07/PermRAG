@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass
@@ -6,6 +7,7 @@ from datetime import UTC, datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from permrag.db.models import QueryLog
+from permrag.evaluation.evaluator import evaluate_response, push_scores_to_langfuse
 from permrag.llm import generate_answer
 from permrag.observability.langfuse_client import get_langfuse, get_trace_id
 from permrag.rag.retriever import PermissionAwareRetriever
@@ -114,11 +116,39 @@ class Answerer:
             latency_ms=self._elapsed_ms(started),
         )
         await self._log_query(user_id, question, retrieval, result)
+
+        # --- 5. async evaluation (never blocks the response) ----------------
+        # The retrieved chunk texts are what the LLM saw. Passing them as
+        # retrieval_context lets the judge check faithfulness against the
+        # actual evidence, not some other version of the document.
+        chunk_texts = [hit.text for hit in retrieval.hits]
+        asyncio.create_task(
+            self._evaluate_and_score(question, answer_text, chunk_texts)
+        )
+
         return result
 
     @staticmethod
     def _elapsed_ms(started: datetime) -> int:
         return int((datetime.now(UTC) - started).total_seconds() * 1000)
+
+    @staticmethod
+    async def _evaluate_and_score(
+        question: str, answer: str, retrieval_context: list[str]
+    ) -> None:
+        """Run DeepEval metrics and push scores to Langfuse.
+
+        Runs as a fire-and-forget task: any failure is logged and swallowed,
+        never surfaced to the user or allowed to affect the response.
+        """
+        try:
+            scores = await evaluate_response(question, answer, retrieval_context)
+            if scores.error:
+                logger.warning("eval returned an error", extra={"error": scores.error})
+                return
+            push_scores_to_langfuse(scores)
+        except Exception as exc:
+            logger.warning("eval task failed", extra={"error": str(exc)})
     
     async def _log_query(
         self,

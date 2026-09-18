@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from permrag.db.models import AuditLog, DocumentShare, PermissionCheckpoint, UserDepartment
+from permrag.db.models import AuditLog, Document, DocumentShare, PermissionCheckpoint, UserDepartment
 from permrag.permissions.client import (
     REL_MANAGER,
     REL_MEMBER,
@@ -29,7 +29,6 @@ class PermissionService:
         self._session = session
 
     # -- ZedToken checkpoint ------------------------------------------------
-
     async def get_checkpoint_token(self) -> str | None:
         """Newest ZedToken observed. Reads are pinned to this."""
         result = await self._session.execute(
@@ -398,9 +397,28 @@ class PermissionService:
     ) -> tuple[list[str], str | None]:
         """Every document this user may view, pinned to the newest write."""
         token = await self.get_checkpoint_token()
-        return await self._spicedb.lookup_viewable_documents(
+        permitted_ids, observed_token = await self._spicedb.lookup_viewable_documents(
             user_id=str(user_id), zed_token=token, limit=limit
         )
+
+        if not permitted_ids:
+            return permitted_ids, observed_token
+        
+        as_uuid = [uuid.UUID(value) for value in permitted_ids]
+        result = await self._session.execute(
+            select(Document.id).where(Document.id.in_(as_uuid), Document.status != "deleted")
+        )
+        live_ids = {str(row[0]) for row in result.all()}
+
+        filtered = [doc_id for doc_id in permitted_ids if doc_id in live_ids]
+        dropped = len(permitted_ids) - len(filtered)
+        if dropped:
+            logger.warning(
+                "dropped permitted document ids with no live row in postgres",
+                extra={"user_id": str(user_id), "dropped": dropped},
+            )
+
+        return filtered, observed_token
 
     async def user_can_view(self, user_id: uuid.UUID, document_id: uuid.UUID) -> bool:
         token = await self.get_checkpoint_token()

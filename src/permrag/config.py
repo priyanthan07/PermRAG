@@ -93,7 +93,7 @@ class Settings(BaseSettings):
     
     # --- Evaluation (DeepEval) ---
     eval_enabled: bool = True
-    eval_judge_model: str = "gemini-2.0-flash-lite"
+    eval_judge_model: str = "gemini-3.5-flash-lite"
     eval_faithfulness_threshold: float = 0.5
     eval_answer_relevancy_threshold: float = 0.5
     eval_contextual_relevancy_threshold: float = 0.5
