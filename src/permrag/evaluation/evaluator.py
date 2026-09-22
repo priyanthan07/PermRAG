@@ -90,12 +90,21 @@ def _build_judge_model(settings):
     judge_model = settings.eval_judge_model
 
     if judge_model.startswith("gemini"):
+        from google.genai import types
         from deepeval.models.llms.gemini_model import GeminiModel
 
         api_key = None
         if settings.gemini_api_key:
             api_key = settings.gemini_api_key.get_secret_value()
-        return GeminiModel(model=judge_model, api_key=api_key)
+        return GeminiModel(
+            model=judge_model, 
+            api_key=api_key,
+            generation_kwargs={
+                "automatic_function_calling": types.AutomaticFunctionCallingConfig(
+                    disable=True
+                )
+            },
+        )
     else:
         # Falls back to DeepEval's default OpenAI path, which reads
         # OPENAI_API_KEY from the environment.
@@ -179,13 +188,16 @@ async def evaluate_response(
         return EvalScores(error=str(exc))
 
 
-def push_scores_to_langfuse(scores: EvalScores) -> None:
+def push_scores_to_langfuse(scores: EvalScores, trace_id: str | None) -> None:
     """Write eval scores to the current Langfuse trace as numeric scores.
 
     Must be called from within an active Langfuse span context. Scores
     appear in the Langfuse dashboard under the trace's Scores tab.
     """
     from permrag.observability.langfuse_client import get_langfuse
+    
+    if trace_id is None:
+        return
 
     client = get_langfuse()
     if client is None:
@@ -198,6 +210,7 @@ def push_scores_to_langfuse(scores: EvalScores) -> None:
         reason = getattr(scores, f"{name}_reason", None)
         try:
             client.score_current_trace(
+                trace_id=trace_id,
                 name=name,
                 value=float(value),
                 data_type="NUMERIC",

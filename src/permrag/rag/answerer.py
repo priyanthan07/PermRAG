@@ -123,7 +123,7 @@ class Answerer:
         # actual evidence, not some other version of the document.
         chunk_texts = [hit.text for hit in retrieval.hits]
         asyncio.create_task(
-            self._evaluate_and_score(question, answer_text, chunk_texts)
+            self._evaluate_and_score(question, answer_text, chunk_texts, trace_id)
         )
 
         return result
@@ -134,7 +134,7 @@ class Answerer:
 
     @staticmethod
     async def _evaluate_and_score(
-        question: str, answer: str, retrieval_context: list[str]
+        question: str, answer: str, retrieval_context: list[str], trace_id: str | None
     ) -> None:
         """Run DeepEval metrics and push scores to Langfuse.
 
@@ -146,7 +146,7 @@ class Answerer:
             if scores.error:
                 logger.warning("eval returned an error", extra={"error": scores.error})
                 return
-            push_scores_to_langfuse(scores)
+            push_scores_to_langfuse(scores, trace_id)
         except Exception as exc:
             logger.warning("eval task failed", extra={"error": str(exc)})
     
