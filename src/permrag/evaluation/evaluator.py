@@ -209,7 +209,7 @@ def push_scores_to_langfuse(scores: EvalScores, trace_id: str | None) -> None:
             continue
         reason = getattr(scores, f"{name}_reason", None)
         try:
-            client.score_current_trace(
+            client.create_score(
                 trace_id=trace_id,
                 name=name,
                 value=float(value),

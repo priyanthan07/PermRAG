@@ -34,7 +34,17 @@ async def ask(
         from langfuse import propagate_attributes
 
         with propagate_attributes(user_id=str(user.id), trace_name="permrag-chat"):
-            result = await answerer.answer(user_id=user.id, question=payload.question)
+            with langfuse.start_as_current_observation(
+                name="permrag-chat", as_type="span", input={"question": payload.question}
+            ) as span:
+                result = await answerer.answer(user_id=user.id, question=payload.question)
+                span.update(
+                    output={
+                        "answer": result.answer,
+                        "permitted_document_count": result.permitted_document_count,
+                        "retrieved_chunk_count": result.retrieved_chunk_count,
+                    }
+                )
     else:
         result = await answerer.answer(user_id=user.id, question=payload.question)
 
