@@ -1,4 +1,4 @@
-.PHONY: help install up down logs migrate bootstrap run lint fmt clean reset
+.PHONY: help install up down logs migrate bootstrap run lint fmt clean reset check-permissions
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -31,6 +31,9 @@ lint: ## Lint and type-check
 fmt: ## Format
 	uv run ruff format src scripts
 	uv run ruff check --fix src scripts
+
+check-permissions: ## Read-only: compare SpiceDB against the Postgres mirror
+	uv run python scripts/check_permission_consistency.py
 
 clean: ## Remove caches
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

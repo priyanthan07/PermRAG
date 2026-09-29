@@ -136,6 +136,7 @@ class PermRAGClient:
         owner_department_id: str,
         pages: list[dict],
         source_uri: str | None = None,
+        transfer_ownership: bool = False,
     ) -> dict:
         return self._request(
             "POST",
@@ -146,6 +147,7 @@ class PermRAGClient:
                 "owner_department_id": owner_department_id,
                 "source_uri": source_uri,
                 "pages": pages,
+                "transfer_ownership": transfer_ownership,
             },
         )
 

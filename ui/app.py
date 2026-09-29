@@ -500,6 +500,11 @@ def _render_upload_tab(departments: list[dict]) -> None:
         department = st.selectbox(
             "Owning department", departments, format_func=label_for_department
         )
+        transfer = st.checkbox(
+            "Move to this department if the file already belongs to another one",
+            help="Off by default: a file with the same name in another department is "
+            "rejected (409) rather than taken over.",
+        )
         submitted = st.form_submit_button("Ingest files", type="primary")
 
     if not submitted:
@@ -548,9 +553,13 @@ def _render_upload_tab(departments: list[dict]) -> None:
                     owner_department_id=department["id"],
                     pages=parsed.pages,
                     source_uri=upload.name,
+                    transfer_ownership=transfer,
                 )
             except APIError as exc:
-                st.error(f"{exc.status_code}: {exc.detail}")
+                if exc.status_code == 409:
+                    st.warning(exc.detail)
+                else:
+                    st.error(f"{exc.status_code}: {exc.detail}")
                 status.update(label=f"{upload.name} -- ingest failed", state="error")
                 continue
 
@@ -577,6 +586,9 @@ def _render_paste_tab(departments: list[dict]) -> None:
         )
         source_uri = st.text_input("Source URI (optional)")
         body = st.text_area("Content", height=320)
+        transfer = st.checkbox(
+            "Move to this department if the External ID already belongs to another one"
+        )
         submitted = st.form_submit_button("Ingest text", type="primary")
 
     if not submitted:
@@ -612,9 +624,13 @@ def _render_paste_tab(departments: list[dict]) -> None:
                 owner_department_id=department["id"],
                 pages=pages,
                 source_uri=source_uri.strip() or None,
+                transfer_ownership=transfer,
             )
         except APIError as exc:
-            show_error(exc)
+            if exc.status_code == 409:
+                st.warning(exc.detail)
+            else:
+                show_error(exc)
             return
 
     clear_lookups()
