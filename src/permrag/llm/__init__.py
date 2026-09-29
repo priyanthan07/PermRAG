@@ -23,6 +23,22 @@ def _provider():
     return openai_client
 
 
+def active_chat_model() -> str:
+    """Name of the model answering questions, as reported to tracing."""
+    settings = get_settings()
+    if settings.llm_provider == "gemini":
+        return settings.gemini_chat_model
+    return settings.openai_chat_model
+
+
+def active_embedding_model() -> str:
+    """Name of the model producing embeddings, as reported to tracing."""
+    settings = get_settings()
+    if settings.llm_provider == "gemini":
+        return settings.gemini_embedding_model
+    return settings.openai_embedding_model
+
+
 async def embed_texts(texts: list[str]) -> list[list[float]]:
     """Embed document chunks. Order of the returned vectors matches the input."""
     return await _provider().embed_texts(texts)
@@ -48,4 +64,10 @@ async def generate_answer(
     )
 
 
-__all__ = ["embed_texts", "embed_query", "generate_answer"]
+__all__ = [
+    "active_chat_model",
+    "active_embedding_model",
+    "embed_texts",
+    "embed_query",
+    "generate_answer",
+]

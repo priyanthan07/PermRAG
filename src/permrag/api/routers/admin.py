@@ -117,13 +117,14 @@ async def deactivate_user(
 @router.post("/memberships", response_model=MembershipResponse)
 async def add_membership(
     payload: MembershipRequest,
-    session: DbSession,
     admin: AdminUser,
     permissions: PermissionServiceDep,
 ) -> MembershipResponse:
-    await _assert_exists(session, User, payload.user_id, "User")
-    await _assert_exists(session, Department, payload.department_id, "Department")
+    """Grant membership or change its role.
 
+    404 if the user or department is missing, 409 if the user is deactivated
+    (checked by the service).
+    """
     token = await permissions.add_user_to_department(
         user_id=payload.user_id,
         department_id=payload.department_id,
@@ -141,7 +142,6 @@ async def add_membership(
 async def remove_membership(
     user_id: uuid.UUID,
     department_id: uuid.UUID,
-    session: DbSession,
     admin: AdminUser,
     permissions: PermissionServiceDep,
 ) -> MessageResponse:
@@ -167,8 +167,3 @@ async def list_department_members(
         .order_by(User.email)
     )
     return list(result.scalars().all())
-
-async def _assert_exists(session, model, record_id: uuid.UUID, label: str) -> None:
-    result = await session.execute(select(model).where(model.id == record_id))
-    if result.scalar_one_or_none() is None:
-        raise NotFoundError(f"{label} {record_id} not found")

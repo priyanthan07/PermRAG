@@ -1,11 +1,23 @@
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
 from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from permrag.db.models import AuditLog, Document, DocumentShare, PermissionCheckpoint, UserDepartment
+from permrag.db.models import (
+    AuditLog,
+    Department,
+    Document,
+    DocumentShare,
+    PermissionCheckpoint,
+    User,
+    UserDepartment,
+)
+from permrag.db.session import checkpoint_scope
+from permrag.exceptions import ConflictError, NotFoundError
 from permrag.permissions.client import (
     REL_MANAGER,
     REL_MEMBER,
@@ -22,7 +34,18 @@ from permrag.permissions.client import (
 logger = logging.getLogger(__name__)
 
 class PermissionService:
-    """Owns every write to SpiceDB and the Postgres mirror that shadows it."""
+    """
+        Owns every write to SpiceDB and the Postgres mirror that shadows it.
+
+        Every write follows the same order:
+
+        1. Validate (the subject and resource exist; the user is active).
+        2. Stage the mirror and audit rows and flush them, so a constraint
+           failure aborts the request before SpiceDB is touched.
+        3. Write SpiceDB under the checkpoint lock (``_write_and_checkpoint``).
+
+        The request's transaction commits the mirror and audit rows afterwards.
+    """
 
     def __init__(self, spicedb: SpiceDBClient, session: AsyncSession) -> None:
         self._spicedb = spicedb
@@ -37,17 +60,69 @@ class PermissionService:
         checkpoint = result.scalar_one_or_none()
         return checkpoint.zed_token if checkpoint else None
 
-    async def _store_checkpoint_token(self, token: str) -> None:
-        result = await self._session.execute(
-            select(PermissionCheckpoint).where(PermissionCheckpoint.id == 1)
-        )
-        checkpoint = result.scalar_one_or_none()
-        if checkpoint is None:
-            checkpoint = PermissionCheckpoint(id=1, zed_token=token)
-            self._session.add(checkpoint)
-        else:
+    async def _write_and_checkpoint(self, apply: Callable[[], Awaitable[str]]) -> str:
+        """
+            Run a SpiceDB write and record its ZedToken, strictly in write order.
+
+            ``apply`` performs the write (and any read it depends on) and returns
+            the new token. It runs while the checkpoint row is locked, in a short
+            transaction of its own:
+
+            - Ordering: writers queue on the lock *before* touching SpiceDB, so
+              tokens are stored in the order the writes happened. ZedTokens are
+              opaque and cannot be compared, so ordering is the only way to
+              guarantee the stored token never moves backwards.
+            - Duration: the lock covers one SpiceDB round-trip, never the
+              caller's whole request -- an ingestion keeps its transaction open
+              while it embeds.
+        """
+        async with checkpoint_scope() as session:
+            checkpoint = await self._lock_checkpoint(session)
+            token = await apply()
             checkpoint.zed_token = token
-        await self._session.flush()
+        return token
+
+    @staticmethod
+    async def _lock_checkpoint(session: AsyncSession) -> PermissionCheckpoint:
+        locked = select(PermissionCheckpoint).where(PermissionCheckpoint.id == 1).with_for_update()
+        checkpoint = (await session.execute(locked)).scalar_one_or_none()
+        if checkpoint is None:
+            # First write on a fresh database. Concurrent first writers race on
+            # the insert; ON CONFLICT lets the losers fall through to the lock.
+            await session.execute(
+                pg_insert(PermissionCheckpoint).values(id=1).on_conflict_do_nothing(index_elements=["id"])
+            )
+            checkpoint = (await session.execute(locked)).scalar_one()
+        return checkpoint
+
+    async def _write(
+        self,
+        creates: list[RelationshipTuple] | None = None,
+        deletes: list[RelationshipTuple] | None = None,
+    ) -> str:
+        return await self._write_and_checkpoint(
+            lambda: self._spicedb.write_relationships(creates=creates, deletes=deletes)
+        )
+
+    # -- validation ---------------------------------------------------------
+
+    async def _require_active_user(self, user_id: uuid.UUID) -> None:
+        user = await self._session.get(User, user_id)
+        if user is None:
+            raise NotFoundError(f"User {user_id} not found")
+        if not user.is_active:
+            # Deactivation strips every edge; granting again would quietly
+            # undo that.
+            raise ConflictError(f"User {user_id} is deactivated; access cannot be granted")
+
+    async def _require_department(self, department_id: uuid.UUID) -> None:
+        if await self._session.get(Department, department_id) is None:
+            raise NotFoundError(f"Department {department_id} not found")
+
+    async def _require_live_document(self, document_id: uuid.UUID) -> None:
+        document = await self._session.get(Document, document_id)
+        if document is None or document.status == "deleted":
+            raise NotFoundError(f"Document {document_id} not found")
 
     # -- audit --------------------------------------------------------------
 
@@ -73,16 +148,9 @@ class PermissionService:
 
     # -- department membership ---------------------------------------------
 
-    async def add_user_to_department(
-        self,
-        user_id: uuid.UUID,
-        department_id: uuid.UUID,
-        actor_id: uuid.UUID | None,
-        is_manager: bool = False,
-    ) -> str:
-        """Grant department membership. SpiceDB first, then the mirror."""
-        relation = REL_MANAGER if is_manager else REL_MEMBER
-        tup = RelationshipTuple(
+    @staticmethod
+    def _membership(department_id: uuid.UUID, relation: str, user_id: uuid.UUID) -> RelationshipTuple:
+        return RelationshipTuple(
             resource_type=TYPE_DEPARTMENT,
             resource_id=str(department_id),
             relation=relation,
@@ -90,8 +158,16 @@ class PermissionService:
             subject_id=str(user_id),
         )
 
-        token = await self._spicedb.write_relationships(creates=[tup])
-        await self._store_checkpoint_token(token)
+    async def add_user_to_department(
+        self,
+        user_id: uuid.UUID,
+        department_id: uuid.UUID,
+        actor_id: uuid.UUID | None,
+        is_manager: bool = False,
+    ) -> str:
+        """Grant membership, or change its role. Exactly one relation remains."""
+        await self._require_active_user(user_id)
+        await self._require_department(department_id)
 
         existing = await self._session.execute(
             select(UserDepartment).where(
@@ -119,8 +195,14 @@ class PermissionService:
             str(department_id),
             {"user_id": str(user_id), "is_manager": is_manager},
         )
-        await self._session.flush()
-        return token
+
+        # One atomic write: grant the target relation and drop the other, so a
+        # promotion or demotion never leaves both behind.
+        relation, stale = (REL_MANAGER, REL_MEMBER) if is_manager else (REL_MEMBER, REL_MANAGER)
+        return await self._write(
+            creates=[self._membership(department_id, relation, user_id)],
+            deletes=[self._membership(department_id, stale, user_id)],
+        )
 
     async def remove_user_from_department(
         self,
@@ -129,20 +211,6 @@ class PermissionService:
         actor_id: uuid.UUID | None,
     ) -> str:
         """Revoke department membership. Both relations are removed."""
-        deletes = [
-            RelationshipTuple(
-                resource_type=TYPE_DEPARTMENT,
-                resource_id=str(department_id),
-                relation=relation,
-                subject_type=TYPE_USER,
-                subject_id=str(user_id),
-            )
-            for relation in (REL_MEMBER, REL_MANAGER)
-        ]
-
-        token = await self._spicedb.write_relationships(deletes=deletes)
-        await self._store_checkpoint_token(token)
-
         await self._session.execute(
             delete(UserDepartment).where(
                 UserDepartment.user_id == user_id,
@@ -156,8 +224,9 @@ class PermissionService:
             str(department_id),
             {"user_id": str(user_id)},
         )
-        await self._session.flush()
-        return token
+        return await self._write(
+            deletes=[self._membership(department_id, relation, user_id) for relation in (REL_MEMBER, REL_MANAGER)]
+        )
 
     # -- document ownership -------------------------------------------------
 
@@ -167,20 +236,12 @@ class PermissionService:
         department_id: uuid.UUID,
         actor_id: uuid.UUID | None,
     ) -> str:
-        """Bind a document to its owning department.
+        """Bind a document to its single owning department.
 
         Called during ingestion *before* any chunk is written to the vector
         store, so a chunk is never searchable before its ownership edge exists.
+        Any previous owner's edge is removed in the same atomic write.
         """
-        tup = RelationshipTuple(
-            resource_type=TYPE_DOCUMENT,
-            resource_id=str(document_id),
-            relation=REL_OWNER_DEPARTMENT,
-            subject_type=TYPE_DEPARTMENT,
-            subject_id=str(department_id),
-        )
-        token = await self._spicedb.write_relationships(creates=[tup])
-        await self._store_checkpoint_token(token)
         await self._audit(
             actor_id,
             "document.owner.set",
@@ -188,9 +249,46 @@ class PermissionService:
             str(document_id),
             {"department_id": str(department_id)},
         )
-        return token
+
+        owner = RelationshipTuple(
+            resource_type=TYPE_DOCUMENT,
+            resource_id=str(document_id),
+            relation=REL_OWNER_DEPARTMENT,
+            subject_type=TYPE_DEPARTMENT,
+            subject_id=str(department_id),
+        )
+
+        async def replace_owner() -> str:
+            # Read inside the lock: two concurrent owner changes must not both
+            # see the same old owner and each leave their own edge behind.
+            current = await self._spicedb.read_relationships(
+                resource_type=TYPE_DOCUMENT,
+                resource_id=str(document_id),
+                relation=REL_OWNER_DEPARTMENT,
+            )
+            stale = [edge for edge in current if edge.subject_id != str(department_id)]
+            if stale:
+                logger.info(
+                    "document owner changed",
+                    extra={"document_id": str(document_id), "removed_owners": [e.subject_id for e in stale]},
+                )
+            return await self._spicedb.write_relationships(creates=[owner], deletes=stale)
+
+        return await self._write_and_checkpoint(replace_owner)
 
     # -- cross-department sharing ------------------------------------------
+
+    @staticmethod
+    def _document_edge(
+        document_id: uuid.UUID, relation: str, subject_type: str, subject_id: uuid.UUID
+    ) -> RelationshipTuple:
+        return RelationshipTuple(
+            resource_type=TYPE_DOCUMENT,
+            resource_id=str(document_id),
+            relation=relation,
+            subject_type=subject_type,
+            subject_id=str(subject_id),
+        )
 
     async def share_document_with_department(
         self,
@@ -199,15 +297,8 @@ class PermissionService:
         actor_id: uuid.UUID | None,
         reason: str | None = None,
     ) -> str:
-        tup = RelationshipTuple(
-            resource_type=TYPE_DOCUMENT,
-            resource_id=str(document_id),
-            relation=REL_SHARED_DEPARTMENT,
-            subject_type=TYPE_DEPARTMENT,
-            subject_id=str(department_id),
-        )
-        token = await self._spicedb.write_relationships(creates=[tup])
-        await self._store_checkpoint_token(token)
+        await self._require_live_document(document_id)
+        await self._require_department(department_id)
 
         existing = await self._session.execute(
             select(DocumentShare).where(
@@ -232,8 +323,9 @@ class PermissionService:
             str(document_id),
             {"department_id": str(department_id), "reason": reason},
         )
-        await self._session.flush()
-        return token
+        return await self._write(
+            creates=[self._document_edge(document_id, REL_SHARED_DEPARTMENT, TYPE_DEPARTMENT, department_id)]
+        )
 
     async def unshare_document_with_department(
         self,
@@ -241,16 +333,6 @@ class PermissionService:
         department_id: uuid.UUID,
         actor_id: uuid.UUID | None,
     ) -> str:
-        tup = RelationshipTuple(
-            resource_type=TYPE_DOCUMENT,
-            resource_id=str(document_id),
-            relation=REL_SHARED_DEPARTMENT,
-            subject_type=TYPE_DEPARTMENT,
-            subject_id=str(department_id),
-        )
-        token = await self._spicedb.write_relationships(deletes=[tup])
-        await self._store_checkpoint_token(token)
-
         await self._session.execute(
             delete(DocumentShare).where(
                 DocumentShare.document_id == document_id,
@@ -264,8 +346,9 @@ class PermissionService:
             str(document_id),
             {"department_id": str(department_id)},
         )
-        await self._session.flush()
-        return token
+        return await self._write(
+            deletes=[self._document_edge(document_id, REL_SHARED_DEPARTMENT, TYPE_DEPARTMENT, department_id)]
+        )
 
     # -- person-level overrides --------------------------------------------
 
@@ -277,15 +360,8 @@ class PermissionService:
         reason: str | None = None,
     ) -> str:
         """Give one person access without moving them between departments."""
-        tup = RelationshipTuple(
-            resource_type=TYPE_DOCUMENT,
-            resource_id=str(document_id),
-            relation=REL_VIEWER,
-            subject_type=TYPE_USER,
-            subject_id=str(user_id),
-        )
-        token = await self._spicedb.write_relationships(creates=[tup])
-        await self._store_checkpoint_token(token)
+        await self._require_live_document(document_id)
+        await self._require_active_user(user_id)
 
         existing = await self._session.execute(
             select(DocumentShare).where(
@@ -310,8 +386,7 @@ class PermissionService:
             str(document_id),
             {"user_id": str(user_id), "reason": reason},
         )
-        await self._session.flush()
-        return token
+        return await self._write(creates=[self._document_edge(document_id, REL_VIEWER, TYPE_USER, user_id)])
 
     async def revoke_document_from_user(
         self,
@@ -319,16 +394,6 @@ class PermissionService:
         user_id: uuid.UUID,
         actor_id: uuid.UUID | None,
     ) -> str:
-        tup = RelationshipTuple(
-            resource_type=TYPE_DOCUMENT,
-            resource_id=str(document_id),
-            relation=REL_VIEWER,
-            subject_type=TYPE_USER,
-            subject_id=str(user_id),
-        )
-        token = await self._spicedb.write_relationships(deletes=[tup])
-        await self._store_checkpoint_token(token)
-
         await self._session.execute(
             delete(DocumentShare).where(
                 DocumentShare.document_id == document_id,
@@ -342,8 +407,7 @@ class PermissionService:
             str(document_id),
             {"user_id": str(user_id)},
         )
-        await self._session.flush()
-        return token
+        return await self._write(deletes=[self._document_edge(document_id, REL_VIEWER, TYPE_USER, user_id)])
 
     # -- teardown -----------------------------------------------------------
 
@@ -357,13 +421,10 @@ class PermissionService:
         Called before the document's chunks are deleted from the vector store,
         so access disappears ahead of the content rather than after it.
         """
-        token = await self._spicedb.delete_by_filter(
-            resource_type=TYPE_DOCUMENT,
-            resource_id=str(document_id),
-        )
-        await self._store_checkpoint_token(token)
         await self._audit(actor_id, "document.relationships.purge", "document", str(document_id))
-        return token
+        return await self._write_and_checkpoint(
+            lambda: self._spicedb.delete_by_filter(resource_type=TYPE_DOCUMENT, resource_id=str(document_id))
+        )
 
     async def purge_user_relationships(
         self,
@@ -371,24 +432,25 @@ class PermissionService:
         actor_id: uuid.UUID | None,
     ) -> str:
         """Strip a deactivated user from every department and override."""
-        token = await self._spicedb.delete_by_filter(
-            resource_type=TYPE_DEPARTMENT,
-            subject_type=TYPE_USER,
-            subject_id=str(user_id),
-        )
-        token = await self._spicedb.delete_by_filter(
-            resource_type=TYPE_DOCUMENT,
-            relation=REL_VIEWER,
-            subject_type=TYPE_USER,
-            subject_id=str(user_id),
-        )
-        await self._store_checkpoint_token(token)
-
         await self._session.execute(delete(UserDepartment).where(UserDepartment.user_id == user_id))
         await self._session.execute(delete(DocumentShare).where(DocumentShare.user_id == user_id))
         await self._audit(actor_id, "user.relationships.purge", "user", str(user_id))
-        await self._session.flush()
-        return token
+
+        async def purge() -> str:
+            await self._spicedb.delete_by_filter(
+                resource_type=TYPE_DEPARTMENT,
+                subject_type=TYPE_USER,
+                subject_id=str(user_id),
+            )
+            # The second delete is the later revision, so its token covers both.
+            return await self._spicedb.delete_by_filter(
+                resource_type=TYPE_DOCUMENT,
+                relation=REL_VIEWER,
+                subject_type=TYPE_USER,
+                subject_id=str(user_id),
+            )
+
+        return await self._write_and_checkpoint(purge)
 
     # -- reads --------------------------------------------------------------
 
@@ -403,7 +465,7 @@ class PermissionService:
 
         if not permitted_ids:
             return permitted_ids, observed_token
-        
+
         as_uuid = [uuid.UUID(value) for value in permitted_ids]
         result = await self._session.execute(
             select(Document.id).where(Document.id.in_(as_uuid), Document.status != "deleted")
@@ -434,4 +496,3 @@ class PermissionService:
             resource_id=str(document_id),
             zed_token=token,
         )
-        

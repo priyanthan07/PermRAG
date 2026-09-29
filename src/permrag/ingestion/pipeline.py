@@ -3,12 +3,17 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from permrag.config import get_settings
-from permrag.db.models import Document, DocumentPage
-from permrag.exceptions import NotFoundError, ValidationError
+from permrag.db.models import Document, DocumentPage, DocumentShare
+from permrag.exceptions import (
+    ConflictError,
+    NotFoundError,
+    ValidationError,
+    VectorStoreError,
+)
 from permrag.ingestion.chunker import chunk_page, hash_content
 from permrag.llm import embed_texts
 from permrag.permissions.service import PermissionService
@@ -50,6 +55,7 @@ class IngestionPipeline:
         pages: list[PageInput],
         actor_id: uuid.UUID | None,
         source_uri: str | None = None,
+        transfer_ownership: bool = False,
     ) -> IngestionResult:
         if not pages:
             raise ValidationError("Document must contain at least one page")
@@ -63,6 +69,7 @@ class IngestionPipeline:
             title=title,
             owner_department_id=owner_department_id,
             source_uri=source_uri,
+            transfer_ownership=transfer_ownership,
         )
 
         document.status = "indexing"
@@ -107,11 +114,26 @@ class IngestionPipeline:
         title: str,
         owner_department_id: uuid.UUID,
         source_uri: str | None,
+        transfer_ownership: bool,
     ) -> Document:
         existing = await self._session.execute(
             select(Document).where(Document.external_id == external_id)
         )
         document = existing.scalar_one_or_none()
+
+        if (
+            document is not None
+            and document.status != "deleted"
+            and document.owner_department_id != owner_department_id
+            and not transfer_ownership
+        ):
+            # Same external_id, different department: most likely two unrelated
+            # files that collided on an id. Taking it over silently would hand
+            # one department's document to another.
+            raise ConflictError(
+                f"Document '{external_id}' belongs to another department. "
+                "Re-submit with transfer_ownership to move it."
+            )
 
         if document is None:
             document = Document(
@@ -240,16 +262,35 @@ class IngestionPipeline:
                 existing_page.version = version
 
     async def delete_document(self, document_id: uuid.UUID, actor_id: uuid.UUID | None) -> None:
-        """Tear down a document: permissions first, then content."""
+        """
+            Tear down a document: Postgres staged first, then access, then content.
+
+            Share rows go so the mirror matches SpiceDB; page rows go so a later
+            re-ingest of the same external_id indexes every page instead of
+            skipping "unchanged" pages whose chunks no longer exist.
+        """
         result = await self._session.execute(select(Document).where(Document.id == document_id))
         document = result.scalar_one_or_none()
         if document is None:
             raise NotFoundError(f"Document {document_id} not found")
 
-        await self._permissions.purge_document_relationships(document_id, actor_id)
-        await self._store.delete_document(str(document_id))
-
+        await self._session.execute(delete(DocumentShare).where(DocumentShare.document_id == document_id))
+        await self._session.execute(delete(DocumentPage).where(DocumentPage.document_id == document_id))
         document.status = "deleted"
         await self._session.flush()
+
+        await self._permissions.purge_document_relationships(document_id, actor_id)
+
+        try:
+            await self._store.delete_document(str(document_id))
+        except VectorStoreError:
+            # Access is already gone and the row is marked deleted, so these
+            # chunks can never be retrieved. Failing here would roll Postgres
+            # back and leave it disagreeing with SpiceDB, which is worse.
+            logger.error(
+                "document chunks could not be removed; they are unreachable and need cleanup",
+                extra={"document_id": str(document_id)},
+            )
+
         logger.info("document deleted", extra={"document_id": str(document_id)})
         

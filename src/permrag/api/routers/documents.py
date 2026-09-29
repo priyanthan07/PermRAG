@@ -23,7 +23,7 @@ from permrag.api.schemas import (
     ShareWithDepartmentRequest,
     ShareWithUserRequest,
 )
-from permrag.db.models import Department, Document, User
+from permrag.db.models import Department, Document
 from permrag.exceptions import NotFoundError
 from permrag.ingestion.pipeline import IngestionPipeline, PageInput
 from permrag.vectorstore.qdrant import QdrantVectorStore
@@ -67,6 +67,7 @@ async def ingest_document(
         pages=[PageInput(page_number=p.page_number, content=p.content) for p in payload.pages],
         actor_id=admin.id,
         source_uri=payload.source_uri,
+        transfer_ownership=payload.transfer_ownership,
     )
 
     return DocumentIngestResponse(
@@ -142,11 +143,10 @@ async def delete_document(
 async def share_with_department(
     document_id: uuid.UUID,
     payload: ShareWithDepartmentRequest,
-    session: DbSession,
     admin: AdminUser,
     permissions: PermissionServiceDep,
 ) -> ShareResponse:
-    await _assert_document_exists(session, document_id)
+    """404 if the document or department is missing (checked by the service)."""
     token = await permissions.share_document_with_department(
         document_id=document_id,
         department_id=payload.department_id,
@@ -181,17 +181,14 @@ async def unshare_with_department(
 async def share_with_user(
     document_id: uuid.UUID,
     payload: ShareWithUserRequest,
-    session: DbSession,
     admin: AdminUser,
     permissions: PermissionServiceDep,
 ) -> ShareResponse:
-    """Person-level override: one user, one document, no department change."""
-    await _assert_document_exists(session, document_id)
+    """Person-level override: one user, one document, no department change.
 
-    target = await session.execute(select(User).where(User.id == payload.user_id))
-    if target.scalar_one_or_none() is None:
-        raise NotFoundError(f"User {payload.user_id} not found")
-
+    404 if the document or user is missing, 409 if the user is deactivated
+    (checked by the service).
+    """
     token = await permissions.grant_document_to_user(
         document_id=document_id,
         user_id=payload.user_id,
@@ -241,10 +238,3 @@ async def list_document_access(
             for t in tuples
         ],
     )
-
-
-async def _assert_document_exists(session, document_id: uuid.UUID) -> None:
-    result = await session.execute(select(Document).where(Document.id == document_id))
-    if result.scalar_one_or_none() is None:
-        raise NotFoundError(f"Document {document_id} not found")
-    

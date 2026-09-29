@@ -95,6 +95,8 @@ class DocumentIngestRequest(BaseModel):
     owner_department_id: uuid.UUID
     source_uri: str | None = None
     pages: list[PagePayload] = Field(min_length=1)
+    # Required to re-ingest an external_id that another department owns.
+    transfer_ownership: bool = False
 
 
 class DocumentIngestResponse(BaseModel):

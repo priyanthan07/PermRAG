@@ -1,8 +1,19 @@
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
+
 from langfuse import Langfuse
 from permrag.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+class _NoopObservation:
+    """Stands in for a Langfuse observation when tracing is disabled."""
+
+    def update(self, **_: Any) -> "_NoopObservation":
+        return self
 
 _client: Langfuse | None = None
 _disabled: bool = False
@@ -48,6 +59,24 @@ def get_trace_id() -> str | None:
     except Exception:
         return None
     
+@contextmanager
+def observe_step(name: str, as_type: str = "span", **kwargs: Any) -> Iterator[Any]:
+    """
+        Open a Langfuse observation as a child of the current one.
+
+        When tracing is disabled this yields a no-op object with the same
+        ``update(...)`` method, so call sites never branch on whether Langfuse
+        is configured.
+    """
+    client = get_langfuse()
+    if client is None:
+        yield _NoopObservation()
+        return
+
+    with client.start_as_current_observation(name=name, as_type=as_type, **kwargs) as observation:  # type: ignore[call-overload]
+        yield observation
+
+
 def shutdown_langfuse() -> None:
     """Flush pending spans. Called from the FastAPI lifespan shutdown hook."""
     global _client

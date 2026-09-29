@@ -1,13 +1,14 @@
 """Chat route: the permission-filtered question answering endpoint."""
 
 import logging
+from contextlib import AbstractContextManager, nullcontext
 from typing import Annotated
 
 from fastapi import APIRouter, Depends
 
 from permrag.api.deps import CurrentUser, get_answerer
 from permrag.api.schemas import ChatRequest, ChatResponse, CitationResponse
-from permrag.observability.langfuse_client import get_langfuse
+from permrag.observability.langfuse_client import get_langfuse, observe_step
 from permrag.rag.answerer import Answerer
 
 logger = logging.getLogger(__name__)
@@ -28,25 +29,22 @@ async def ask(
     The user id comes from the verified bearer token, never from the request
     body -- otherwise a caller could ask questions as somebody else.
     """
-    langfuse = get_langfuse()
-
-    if langfuse is not None:
+    trace_attributes: AbstractContextManager[object] = nullcontext()
+    if get_langfuse() is not None:
         from langfuse import propagate_attributes
 
-        with propagate_attributes(user_id=str(user.id), trace_name="permrag-chat"):
-            with langfuse.start_as_current_observation(
-                name="permrag-chat", as_type="span", input={"question": payload.question}
-            ) as span:
-                result = await answerer.answer(user_id=user.id, question=payload.question)
-                span.update(
-                    output={
-                        "answer": result.answer,
-                        "permitted_document_count": result.permitted_document_count,
-                        "retrieved_chunk_count": result.retrieved_chunk_count,
-                    }
-                )
-    else:
-        result = await answerer.answer(user_id=user.id, question=payload.question)
+        trace_attributes = propagate_attributes(user_id=str(user.id), trace_name="permrag-chat")
+
+    with trace_attributes:
+        with observe_step("permrag-chat", input={"question": payload.question}) as span:
+            result = await answerer.answer(user_id=user.id, question=payload.question)
+            span.update(
+                output={
+                    "answer": result.answer,
+                    "permitted_document_count": result.permitted_document_count,
+                    "retrieved_chunk_count": result.retrieved_chunk_count,
+                }
+            )
 
     return ChatResponse(
         answer=result.answer,

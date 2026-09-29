@@ -24,6 +24,14 @@ logger = logging.getLogger(__name__)
 _engine: AsyncEngine | None = None
 _session_factory: async_sessionmaker[AsyncSession] | None = None
 
+# Dedicated pool for ZedToken checkpoint writes. A permission write holds its
+# request connection while it waits for the checkpoint lock; if the checkpoint
+# came from the same pool, enough concurrent writers could take every
+# connection and wait on each other forever.
+_checkpoint_engine: AsyncEngine | None = None
+_checkpoint_factory: async_sessionmaker[AsyncSession] | None = None
+CHECKPOINT_POOL_SIZE = 2
+
 def get_engine() -> AsyncEngine:
     global _engine
     if _engine is None:
@@ -65,12 +73,42 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
             raise
 
 
+@asynccontextmanager
+async def checkpoint_scope() -> AsyncIterator[AsyncSession]:
+    """Short transaction on the checkpoint pool. Commits on success, rolls back on any exception."""
+    global _checkpoint_engine, _checkpoint_factory
+    if _checkpoint_factory is None:
+        settings = get_settings()
+        _checkpoint_engine = create_async_engine(
+            settings.database_url,
+            pool_size=CHECKPOINT_POOL_SIZE,
+            max_overflow=0,
+            pool_pre_ping=True,
+            pool_recycle=1800,
+        )
+        _checkpoint_factory = async_sessionmaker(
+            bind=_checkpoint_engine, class_=AsyncSession, expire_on_commit=False, autoflush=False
+        )
+
+    async with _checkpoint_factory() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+
+
 async def dispose_engine() -> None:
-    """Close the pool. Called from the FastAPI lifespan shutdown hook."""
-    global _engine, _session_factory
+    """Close the pools. Called from the FastAPI lifespan shutdown hook."""
+    global _engine, _session_factory, _checkpoint_engine, _checkpoint_factory
     if _engine is not None:
         await _engine.dispose()
         _engine = None
         _session_factory = None
         logger.info("database engine disposed")
+    if _checkpoint_engine is not None:
+        await _checkpoint_engine.dispose()
+        _checkpoint_engine = None
+        _checkpoint_factory = None
         

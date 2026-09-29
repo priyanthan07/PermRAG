@@ -58,7 +58,7 @@ class Settings(BaseSettings):
     
     # --- Gemini ---
     gemini_api_key: SecretStr | None = None
-    gemini_chat_model: str = "gemini-3.6-flash"
+    gemini_chat_model: str = "gemini-3.8-flash"
     gemini_embedding_model: str = "gemini-embedding-001"
     gemini_embedding_dimensions: int = 3072
     gemini_thinking_level: Literal["LOW", "MEDIUM", "HIGH"] | None = "LOW"
@@ -93,7 +93,7 @@ class Settings(BaseSettings):
     
     # --- Evaluation (DeepEval) ---
     eval_enabled: bool = True
-    eval_judge_model: str = "gemini-3.5-flash-lite"
+    eval_judge_model: str = "gemini-3.1-flash-lite"
     eval_faithfulness_threshold: float = 0.5
     eval_answer_relevancy_threshold: float = 0.5
     eval_contextual_relevancy_threshold: float = 0.5

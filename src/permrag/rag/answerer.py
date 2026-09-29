@@ -8,12 +8,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from permrag.db.models import QueryLog
 from permrag.evaluation.evaluator import evaluate_response, push_scores_to_langfuse
-from permrag.llm import generate_answer
-from permrag.observability.langfuse_client import get_langfuse, get_trace_id
+from permrag.llm import active_chat_model, generate_answer
+from permrag.observability.langfuse_client import get_trace_id, observe_step
 from permrag.rag.retriever import PermissionAwareRetriever
 from permrag.vectorstore.qdrant import SearchHit
 
 logger = logging.getLogger(__name__)
+
+ANSWER_TEMPERATURE = 0.1
+ANSWER_MAX_TOKENS = 900
+
+# Fire-and-forget evaluation tasks still in flight.
+_background_tasks: set[asyncio.Task[None]] = set()
 
 SYSTEM_PROMPT = """
     You are an internal knowledge assistant for a large organization.
@@ -78,7 +84,6 @@ class Answerer:
         
     async def answer(self, user_id: uuid.UUID, question: str) -> AnswerResult:
         started = datetime.now(UTC)
-        langfuse = get_langfuse()
 
         retrieval = await self._retriever.retrieve(user_id, question)
 
@@ -97,15 +102,21 @@ class Answerer:
         context, citations = build_context(retrieval.hits)
         user_prompt = f"Passages:\n\n{context}\n\nQuestion: {question}"
 
-        trace_id: str | None = None
-
-        if langfuse is not None:
-            with langfuse.start_as_current_observation(name="generate-answer", as_type="generation", input={"question": question}) as span:
-                answer_text, usage = await generate_answer(SYSTEM_PROMPT, user_prompt)
-                span.update(output=answer_text, usage_details=usage)
-                trace_id = get_trace_id()
-        else:
-            answer_text, _ = await generate_answer(SYSTEM_PROMPT, user_prompt)
+        with observe_step(
+            "generate-answer",
+            as_type="generation",
+            model=active_chat_model(),
+            model_parameters={"temperature": ANSWER_TEMPERATURE, "max_tokens": ANSWER_MAX_TOKENS},
+            input={"question": question},
+        ) as span:
+            answer_text, usage = await generate_answer(
+                SYSTEM_PROMPT,
+                user_prompt,
+                temperature=ANSWER_TEMPERATURE,
+                max_tokens=ANSWER_MAX_TOKENS,
+            )
+            span.update(output=answer_text, usage_details=usage)
+            trace_id = get_trace_id()
 
         result = AnswerResult(
             answer=answer_text,
@@ -122,9 +133,13 @@ class Answerer:
         # retrieval_context lets the judge check faithfulness against the
         # actual evidence, not some other version of the document.
         chunk_texts = [hit.text for hit in retrieval.hits]
-        asyncio.create_task(
+        # The event loop only holds a weak reference to a task; keep a strong
+        # one until it finishes or it can be collected mid-evaluation.
+        task = asyncio.create_task(
             self._evaluate_and_score(question, answer_text, chunk_texts, trace_id)
         )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
 
         return result
 

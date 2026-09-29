@@ -14,8 +14,8 @@ from dataclasses import dataclass
 
 from permrag.config import get_settings
 from permrag.exceptions import PermissionSystemError
-from permrag.llm import embed_query
-from permrag.observability.langfuse_client import get_langfuse
+from permrag.llm import active_embedding_model, embed_query
+from permrag.observability.langfuse_client import observe_step
 from permrag.permissions.service import PermissionService
 from permrag.rag.reranker import rerank_with_scores
 from permrag.vectorstore.qdrant import QdrantVectorStore, SearchHit
@@ -37,17 +37,13 @@ class PermissionAwareRetriever:
         self._settings = get_settings()
         
     async def retrieve(self, user_id: uuid.UUID, question: str) -> RetrievalResult:
-        langfuse = get_langfuse()
         max_docs = self._settings.max_permitted_documents
-        
+
         # -- 1. permission lookup ------------------------------------------
-        if langfuse is not None:
-            with langfuse.start_as_current_observation(name="permission-lookup", as_type="span", input={"user_id": str(user_id)}) as span:
-                permitted_ids, zed_token = await self._lookup(user_id, max_docs)
-                span.update(output={"permitted_document_count": len(permitted_ids)})
-        else:
+        with observe_step("permission-lookup", input={"user_id": str(user_id)}) as span:
             permitted_ids, zed_token = await self._lookup(user_id, max_docs)
-            
+            span.update(output={"permitted_document_count": len(permitted_ids)})
+
         truncated = len(permitted_ids) >= max_docs
         if truncated:
             # The filter would silently omit documents beyond the cap, which
@@ -59,37 +55,32 @@ class PermissionAwareRetriever:
             return RetrievalResult([], [], zed_token, truncated)
         
         # -- 2. filtered vector search -------------------------------------
-        query_vector = await embed_query(question)
+        with observe_step(
+            "embed-query", as_type="embedding", model=active_embedding_model(), input=question
+        ) as span:
+            query_vector = await embed_query(question)
+            span.update(output={"dimensions": len(query_vector)})
 
-        if langfuse is not None:
-            with langfuse.start_as_current_observation(
-                name="vector-search", as_type="retriever", input={"question": question}
-            ) as span:
-                hits = await self._store.search(
-                    query_vector=query_vector,
-                    permitted_document_ids=permitted_ids,
-                    limit=self._settings.retrieval_candidate_limit,
-                )
-                span.update(
-                    output={
-                        "hit_count": len(hits),
-                        "hits": [
-                            {
-                                "title": hit.title,
-                                "page_number": hit.page_number,
-                                "embedding_score": round(hit.score, 4),
-                            }
-                            for hit in hits
-                        ],
-                    }
-                )
-        else:
+        with observe_step("vector-search", as_type="retriever", input={"question": question}) as span:
             hits = await self._store.search(
                 query_vector=query_vector,
                 permitted_document_ids=permitted_ids,
                 limit=self._settings.retrieval_candidate_limit,
             )
-            
+            span.update(
+                output={
+                    "hit_count": len(hits),
+                    "hits": [
+                        {
+                            "title": hit.title,
+                            "page_number": hit.page_number,
+                            "embedding_score": round(hit.score, 4),
+                        }
+                        for hit in hits
+                    ],
+                }
+            )
+
         # -- 3. defence-in-depth assertion ---------------------------------
         permitted_set = set(permitted_ids)
         verified: list[SearchHit] = []
@@ -109,28 +100,23 @@ class PermissionAwareRetriever:
         # -- 4. rerank ------------------------------------------------------
         final_limit = self._settings.retrieval_final_limit
  
-        if langfuse is not None:
-            with langfuse.start_as_current_observation(
-                name="rerank", as_type="span", input={"candidate_count": len(verified)}
-            ) as span:
-                scored = await rerank_with_scores(question, verified, final_limit)
-                span.update(
-                    output={
-                        "kept": len(scored),
-                        "dropped_below_floor": len(verified) - len(scored),
-                        "results": [
-                            {
-                                "title": hit.title,
-                                "page_number": hit.page_number,
-                                "embedding_score": round(hit.score, 4),
-                                "rerank_score": round(score, 4) if score is not None else None,
-                            }
-                            for hit, score in scored
-                        ],
-                    }
-                )
-        else:
+        with observe_step("rerank", input={"candidate_count": len(verified)}) as span:
             scored = await rerank_with_scores(question, verified, final_limit)
+            span.update(
+                output={
+                    "kept": len(scored),
+                    "dropped_below_floor": len(verified) - len(scored),
+                    "results": [
+                        {
+                            "title": hit.title,
+                            "page_number": hit.page_number,
+                            "embedding_score": round(hit.score, 4),
+                            "rerank_score": round(score, 4) if score is not None else None,
+                        }
+                        for hit, score in scored
+                    ],
+                }
+            )
 
         final = [hit for hit, _ in scored]
         reranked = any(score is not None for _, score in scored)

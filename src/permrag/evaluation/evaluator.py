@@ -16,22 +16,23 @@ Results are pushed to Langfuse as numeric scores on the current trace, so
 they appear in the dashboard alongside the retrieval and generation spans.
 They're also logged as structured JSON for any non-Langfuse monitoring.
 
-The judge model defaults to gemini-2.0-flash-lite. It's intentionally
-different from the answering model (gemini-3.6-flash): a cheap, fast model
-is the right choice for a judge that runs on every single request, and using
-a different model avoids the circular problem of a model grading its own
+The judge model is EVAL_JUDGE_MODEL. It's intentionally a different model
+from the one answering (GEMINI_CHAT_MODEL / OPENAI_CHAT_MODEL): a cheap, fast
+model is the right choice for a judge that runs on every single request, and
+using a different model avoids the circular problem of a model grading its own
 work.
 """
 
 import asyncio
 import logging
 from dataclasses import dataclass
+from typing import Any
 
 from permrag.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-_metrics_cache: dict | None = None
+_judge_cache: Any = None
 
 
 @dataclass(slots=True)
@@ -45,20 +46,31 @@ class EvalScores:
     error: str | None = None
 
 
+def _get_judge(settings):
+    """The judge client is stateless per request, so one per process is shared."""
+    global _judge_cache
+
+    if _judge_cache is None:
+        _judge_cache = _build_judge_model(settings)
+        logger.info("eval judge initialised", extra={"judge_model": settings.eval_judge_model})
+    return _judge_cache
+
+
 def _build_metrics():
+    """
+        Fresh metric instances for one evaluation.
 
-    global _metrics_cache
-    
-    if _metrics_cache is not None:
-        return _metrics_cache
-
+        DeepEval writes ``score`` and ``reason`` onto the metric object itself,
+        so instances must never be shared between concurrent requests or one
+        request can read back another's result.
+    """
     settings = get_settings()
 
     from deepeval.metrics import (AnswerRelevancyMetric, ContextualRelevancyMetric, FaithfulnessMetric)
 
-    judge = _build_judge_model(settings)
+    judge = _get_judge(settings)
 
-    _metrics_cache = {
+    return {
         "faithfulness": FaithfulnessMetric(
             threshold=settings.eval_faithfulness_threshold,
             model=judge,
@@ -78,11 +90,6 @@ def _build_metrics():
             verbose_mode=False,
         ),
     }
-    logger.info(
-        "eval metrics initialised",
-        extra={"judge_model": settings.eval_judge_model},
-    )
-    return _metrics_cache
 
 
 def _build_judge_model(settings):
@@ -104,6 +111,15 @@ def _build_judge_model(settings):
                     disable=True
                 )
             },
+            # Forwarded verbatim to genai.Client(). The SDK ships with retries OFF, so a capacity 503 on the judge kills the whole eval.
+            http_options=types.HttpOptions(
+                retry_options=types.HttpRetryOptions(
+                    attempts=4,
+                    initial_delay=1.0,
+                    max_delay=20.0,
+                    http_status_codes=[429, 500, 502, 503, 504],
+                )
+            ),
         )
     else:
         # Falls back to DeepEval's default OpenAI path, which reads

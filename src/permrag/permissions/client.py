@@ -3,11 +3,11 @@ from dataclasses import dataclass
 
 import grpc
 from authzed.api.v1 import (
-    Cursor,
     CheckPermissionRequest,
     CheckPermissionResponse,
     Client,
     Consistency,
+    Cursor,
     DeleteRelationshipsRequest,
     LookupResourcesRequest,
     ObjectReference,
@@ -229,14 +229,23 @@ class SpiceDBClient:
         paged with a cursor and the pages are concatenated. Without this,
         any organisation whose users can see more than that many documents
         would fail closed on every single query.
+
+        SpiceDB yields a document once per path that grants it (owner
+        department, a shared department, a direct grant). Results are
+        de-duplicated here, and only distinct documents count toward `limit`.
         """
         document_ids: list[str] = []
+        seen: set[str] = set()
         observed_token: str | None = None
         cursor: Cursor | None = None
 
+        # Fixed for the whole lookup: SpiceDB rejects a cursor follow-up whose
+        # parameters (optional_limit included) differ from the first call's.
+        # The last page may overshoot `limit`; the extra ids are dropped below.
+        page_size = min(SPICEDB_MAX_PAGE_SIZE, limit)
+
         try:
             while len(document_ids) < limit:
-                page_size = min(SPICEDB_MAX_PAGE_SIZE, limit - len(document_ids))
                 request = LookupResourcesRequest(
                     consistency=self._consistency(zed_token),
                     resource_object_type=TYPE_DOCUMENT,
@@ -250,8 +259,11 @@ class SpiceDBClient:
                 next_cursor: Cursor | None = None
 
                 async for response in self._client.LookupResources(request):
-                    document_ids.append(response.resource_object_id)
                     received += 1
+                    document_id = response.resource_object_id
+                    if document_id not in seen and len(document_ids) < limit:
+                        seen.add(document_id)
+                        document_ids.append(document_id)
                     if response.looked_up_at.token:
                         observed_token = response.looked_up_at.token
                     if response.HasField("after_result_cursor"):
