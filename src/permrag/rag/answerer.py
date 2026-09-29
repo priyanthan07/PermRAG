@@ -28,6 +28,7 @@ SYSTEM_PROMPT = """
     - Answer only from the numbered passages provided. They are the complete set of sources available for this question.
     - If the passages do not contain the answer, say so plainly. Never fill the gap with general knowledge or assumption.
     - Cite the passages you used as [1], [2], and so on.
+    - If you calculate a figure that is not stated in the passages, say it is calculated and show the numbers it came from.
     - Be concise and factual. Do not speculate about material you cannot see.
 """
 

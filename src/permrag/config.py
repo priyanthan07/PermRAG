@@ -1,8 +1,11 @@
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, PostgresDsn, SecretStr, computed_field
+from pydantic import Field, PostgresDsn, SecretStr, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Reranker tokens kept free for the question when sizing chunks (~45 words).
+QUESTION_TOKEN_RESERVE = 64
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -99,9 +102,31 @@ class Settings(BaseSettings):
     eval_contextual_relevancy_threshold: float = 0.5
     
     max_permitted_documents: int = Field(default=5000, ge=1)
-    chunk_size_words: int = Field(default=280, ge=50)
-    chunk_overlap_words: int = Field(default=50, ge=0)
-    
+
+    # --- Chunking ---
+    # Measured in reranker tokens (see ingestion/chunker.py). The reranker reads
+    # [CLS] question [SEP] chunk [SEP] within reranker_max_length, so a chunk
+    # may use at most reranker_max_length - 3 - QUESTION_TOKEN_RESERVE tokens
+    # (445 at the defaults). 400 leaves headroom; the 60-token overlap (15%)
+    # keeps a sentence cut at a boundary whole in one of the two chunks.
+    chunk_size_tokens: int = Field(default=400, ge=32)
+    chunk_overlap_tokens: int = Field(default=60, ge=0)
+
+    @model_validator(mode="after")
+    def _check_chunking(self) -> "Settings":
+        if self.chunk_overlap_tokens >= self.chunk_size_tokens:
+            raise ValueError("CHUNK_OVERLAP_TOKENS must be smaller than CHUNK_SIZE_TOKENS")
+        budget = self.reranker_max_length - 3 - QUESTION_TOKEN_RESERVE
+        if self.reranker_enabled and self.chunk_size_tokens > budget:
+            # Too-long chunks are not an error at query time: the reranker
+            # just truncates them and scores only the head. Refuse to start.
+            raise ValueError(
+                f"CHUNK_SIZE_TOKENS={self.chunk_size_tokens} does not fit the reranker window: "
+                f"at most {budget} ({self.reranker_max_length} - 3 special tokens - "
+                f"{QUESTION_TOKEN_RESERVE} reserved for the question)"
+            )
+        return self
+
     @computed_field  # type: ignore[prop-decorator]
     @property
     def database_url(self) -> str:

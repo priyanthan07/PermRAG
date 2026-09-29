@@ -10,6 +10,7 @@
 
 import logging
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 
 from permrag.config import get_settings
@@ -17,10 +18,13 @@ from permrag.exceptions import PermissionSystemError
 from permrag.llm import active_embedding_model, embed_query
 from permrag.observability.langfuse_client import observe_step
 from permrag.permissions.service import PermissionService
-from permrag.rag.reranker import rerank_with_scores
+from permrag.rag.reranker import rerank_all
 from permrag.vectorstore.qdrant import QdrantVectorStore, SearchHit
 
 logger = logging.getLogger(__name__)
+
+# Enough of each rerank candidate to judge its relevance by eye in a trace.
+SNIPPET_CHARS = 200
 
 @dataclass(slots=True)
 class RetrievalResult:
@@ -99,27 +103,43 @@ class PermissionAwareRetriever:
                 
         # -- 4. rerank ------------------------------------------------------
         final_limit = self._settings.retrieval_final_limit
- 
-        with observe_step("rerank", input={"candidate_count": len(verified)}) as span:
-            scored = await rerank_with_scores(question, verified, final_limit)
+
+        with observe_step(
+            "rerank",
+            input={
+                "candidate_count": len(verified),
+                "top_k": final_limit,
+                "min_score": self._settings.reranker_min_score,
+            },
+        ) as span:
+            decisions = await rerank_all(question, verified, final_limit)
+            embedding_rank = {hit.chunk_id: position for position, hit in enumerate(verified, start=1)}
+            counts = Counter(d.status for d in decisions)
             span.update(
                 output={
-                    "kept": len(scored),
-                    "dropped_below_floor": len(verified) - len(scored),
-                    "results": [
+                    "kept": counts["kept"],
+                    "below_floor": counts["below_floor"],
+                    "beyond_top_k": counts["beyond_top_k"],
+                    # Every candidate, best first -- the rejected ones too, so
+                    # the trace shows why each chunk did or did not reach the LLM.
+                    "candidates": [
                         {
-                            "title": hit.title,
-                            "page_number": hit.page_number,
-                            "embedding_score": round(hit.score, 4),
-                            "rerank_score": round(score, 4) if score is not None else None,
+                            "status": d.status,
+                            "rerank_rank": d.rank,
+                            "rerank_score": round(d.score, 4) if d.score is not None else None,
+                            "embedding_rank": embedding_rank[d.candidate.chunk_id],
+                            "embedding_score": round(d.candidate.score, 4),
+                            "title": d.candidate.title,
+                            "page_number": d.candidate.page_number,
+                            "snippet": d.candidate.text[:SNIPPET_CHARS],
                         }
-                        for hit, score in scored
+                        for d in decisions
                     ],
                 }
             )
 
-        final = [hit for hit, _ in scored]
-        reranked = any(score is not None for _, score in scored)
+        final = [d.candidate for d in decisions if d.status == "kept"]
+        reranked = any(d.score is not None for d in decisions)
  
         return RetrievalResult(final, permitted_ids, zed_token, truncated, reranked)
     

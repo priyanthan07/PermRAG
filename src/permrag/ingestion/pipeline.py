@@ -14,7 +14,7 @@ from permrag.exceptions import (
     ValidationError,
     VectorStoreError,
 )
-from permrag.ingestion.chunker import chunk_page, hash_content
+from permrag.ingestion.chunker import chunk_page, chunking_fingerprint, hash_content
 from permrag.llm import embed_texts
 from permrag.permissions.service import PermissionService
 from permrag.vectorstore.qdrant import ChunkPayload, QdrantVectorStore, build_chunk_id
@@ -160,6 +160,7 @@ class IngestionPipeline:
         incoming_numbers = {p.page_number for p in pages}
 
         indexed = skipped = removed = chunks_written = 0
+        fingerprint = chunking_fingerprint()
 
         # Pages gone from the source: drop their chunks and their rows.
         for page_number, page_row in existing_pages.items():
@@ -169,7 +170,7 @@ class IngestionPipeline:
                 removed += 1
 
         for page in pages:
-            content_hash = hash_content(page.content)
+            content_hash = hash_content(page.content, fingerprint)
             existing_page = existing_pages.get(page.page_number)
 
             if existing_page is not None and existing_page.content_hash == content_hash:
@@ -200,8 +201,8 @@ class IngestionPipeline:
     ) -> int:
         chunks = chunk_page(
             page.content,
-            chunk_size_words=self._settings.chunk_size_words,
-            overlap_words=self._settings.chunk_overlap_words,
+            chunk_size_tokens=self._settings.chunk_size_tokens,
+            overlap_tokens=self._settings.chunk_overlap_tokens,
         )
 
         # Clear the old chunks first. Chunk ids are deterministic, so a page
