@@ -17,6 +17,7 @@ from file_parser import (  # noqa: E402
     parse_file,
 )
 from file_parser import _paginate as paginate_text  # noqa: E402
+from text import safe_answer, slugify  # noqa: E402
 
 DEFAULT_API_URL = os.getenv("PERMRAG_API_URL", "http://localhost:8000")
 
@@ -46,19 +47,24 @@ def logout() -> None:
 def show_error(exc: APIError) -> None:
     """Render an API failure with the distinctions that actually matter here."""
     if exc.status_code == 401:
-        st.error("Session expired or not authorised. Please sign in again.")
+        # Back to the login page, carrying the reason across the rerun.
         logout()
+        st.session_state["flash"] = "Session expired or not authorised. Please sign in again."
+        st.rerun()
     elif exc.status_code == 403:
         st.error("Your account is not an admin, so this action is not available to you.")
     elif exc.status_code == 404:
         # The API deliberately returns 404 rather than 403 for documents you
         # cannot see, so this is not necessarily "missing".
         st.warning(f"Not found, or not visible to your account. ({exc.detail})")
-    elif exc.status_code == 503:
+    elif exc.status_code == 503 and "permission" in exc.detail.lower():
         st.error(
             "The permission system is unreachable, so the request was refused. "
             "PermRAG fails closed by design rather than returning unfiltered results."
         )
+    elif exc.status_code == 503:
+        # Vector store, language model or reranker: not a permission problem.
+        st.error(f"{exc.detail}. Please try again shortly.")
     elif exc.status_code == 0:
         st.error(exc.detail)
     else:
@@ -93,6 +99,8 @@ def _cached_lookup(token: str, api_url: str, kind: str) -> list[dict]:
         return api.list_users()
     if kind == "documents":
         return api.list_documents()
+    if kind == "all_documents":
+        return api.list_all_documents()
     raise ValueError(kind)
 
 
@@ -110,6 +118,8 @@ def clear_lookups() -> None:
 def render_login() -> None:
     st.title("🔐 PermRAG Console")
     st.caption("Permission-aware retrieval. Every answer is filtered by SpiceDB.")
+    if flash := st.session_state.pop("flash", None):
+        st.warning(flash)
 
     with st.form("login"):
         api_url = st.text_input("API URL", value=st.session_state["api_url"])
@@ -156,7 +166,7 @@ def render_chat() -> None:
         with st.chat_message("user"):
             st.write(entry["question"])
         with st.chat_message("assistant"):
-            st.write(entry["answer"])
+            st.write(safe_answer(entry["answer"]))
             _render_answer_meta(entry)
 
     question = st.chat_input("Ask a question...")
@@ -174,7 +184,7 @@ def render_chat() -> None:
                 show_error(exc)
                 return
 
-        st.write(result["answer"])
+        st.write(safe_answer(result["answer"]))
         _render_answer_meta(result)
 
     st.session_state["chat_history"].append({"question": question, **result})
@@ -190,6 +200,12 @@ def _render_answer_meta(result: dict) -> None:
     cols[0].metric("Permitted documents", result.get("permitted_document_count", 0))
     cols[1].metric("Chunks retrieved", result.get("retrieved_chunk_count", 0))
     cols[2].metric("Latency", f"{result.get('latency_ms', 0)} ms")
+
+    if result.get("permitted_documents_truncated"):
+        st.warning(
+            "You can see more documents than are searched per question (the "
+            "MAX_PERMITTED_DOCUMENTS cap), so some of them were not searched."
+        )
 
     citations = result.get("citations") or []
     if citations:
@@ -429,18 +445,6 @@ def render_users() -> None:
 # --- ingest (admin) ----------------------------------------------------------
 
 
-def _slugify(filename: str) -> str:
-    """Derive a stable external_id from a filename.
-
-    Stable matters: re-uploading the same file must produce the same id so the
-    API treats it as an update and skips unchanged pages, rather than creating
-    a duplicate document.
-    """
-    stem = filename.rsplit(".", 1)[0]
-    slug = re.sub(r"[^a-z0-9]+", "-", stem.lower()).strip("-")
-    return slug or "document"
-
-
 def _titleize(filename: str) -> str:
     stem = filename.rsplit(".", 1)[0]
     return re.sub(r"[_-]+", " ", stem).strip().title() or filename
@@ -548,7 +552,7 @@ def _render_upload_tab(departments: list[dict]) -> None:
 
             try:
                 result = client().ingest_document(
-                    external_id=_slugify(upload.name),
+                    external_id=slugify(upload.name),
                     title=_titleize(upload.name),
                     owner_department_id=department["id"],
                     pages=parsed.pages,
@@ -558,8 +562,11 @@ def _render_upload_tab(departments: list[dict]) -> None:
             except APIError as exc:
                 if exc.status_code == 409:
                     st.warning(exc.detail)
+                elif exc.status_code == 0:
+                    # Timed out waiting: the server may still finish the ingest.
+                    st.warning(f"{exc.detail} Check 'My documents' before retrying.")
                 else:
-                    st.error(f"{exc.status_code}: {exc.detail}")
+                    show_error(exc)
                 status.update(label=f"{upload.name} -- ingest failed", state="error")
                 continue
 
@@ -629,6 +636,9 @@ def _render_paste_tab(departments: list[dict]) -> None:
         except APIError as exc:
             if exc.status_code == 409:
                 st.warning(exc.detail)
+            elif exc.status_code == 0:
+                # Timed out waiting: the server may still finish the ingest.
+                st.warning(f"{exc.detail} Check 'My documents' before retrying.")
             else:
                 show_error(exc)
             return
@@ -645,7 +655,9 @@ def render_sharing() -> None:
     st.header("Sharing & access")
 
     try:
-        documents = lookup("documents")
+        # Every document, not just those this admin can view: managing access
+        # must not depend on the admin's own department memberships.
+        documents = lookup("all_documents")
         departments = lookup("departments")
         users = lookup("users")
     except APIError as exc:
@@ -653,7 +665,7 @@ def render_sharing() -> None:
         return
 
     if not documents:
-        st.info("No documents visible to your account yet.")
+        st.info("No documents have been ingested yet.")
         return
 
     document = st.selectbox(
@@ -694,8 +706,14 @@ def render_sharing() -> None:
 
     with col_dept:
         st.subheader("Cross-department share")
+        # No default: a Grant click must never act on whichever row is first.
         dept = st.selectbox(
-            "Department", departments, format_func=label_for_department, key="share_dept"
+            "Department",
+            departments,
+            format_func=label_for_department,
+            key="share_dept",
+            index=None,
+            placeholder="Choose a department",
         )
         reason = st.text_input("Reason (optional)", key="share_dept_reason")
         c1, c2 = st.columns(2)
@@ -719,7 +737,14 @@ def render_sharing() -> None:
 
     with col_user:
         st.subheader("Person-level override")
-        user = st.selectbox("User", users, format_func=label_for_user, key="share_user")
+        user = st.selectbox(
+            "User",
+            users,
+            format_func=label_for_user,
+            key="share_user",
+            index=None,
+            placeholder="Choose a user",
+        )
         reason_u = st.text_input("Reason (optional)", key="share_user_reason")
         c3, c4 = st.columns(2)
         if c3.button("Grant", key="grant_user", use_container_width=True):

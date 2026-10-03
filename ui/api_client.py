@@ -4,6 +4,10 @@ from typing import Any
 
 import httpx
 
+# Ingestion runs inside the request (embedding every changed page), so it can
+# take far longer than a question.
+INGEST_TIMEOUT_SECONDS = 600.0
+
 
 class APIError(Exception):
     """A non-2xx response, carrying the server's own detail message."""
@@ -37,8 +41,10 @@ class PermRAGClient:
         *,
         json: Any = None,
         params: dict[str, Any] | None = None,
+        timeout: float | None = None,
     ) -> Any:
         url = f"{self._base_url}{path}"
+        timeout = timeout or self._timeout
         try:
             response = httpx.request(
                 method,
@@ -46,8 +52,13 @@ class PermRAGClient:
                 json=json,
                 params=params,
                 headers=self._headers(),
-                timeout=self._timeout,
+                timeout=timeout,
             )
+        except httpx.TimeoutException as exc:
+            # The API may still be working on it: a timeout is not a refusal.
+            raise APIError(
+                0, f"The API did not answer within {timeout:.0f}s; the request may still be running."
+            ) from exc
         except httpx.RequestError as exc:
             raise APIError(0, f"Could not reach the API at {url} ({exc})") from exc
 
@@ -141,6 +152,8 @@ class PermRAGClient:
         return self._request(
             "POST",
             "/documents",
+            # Ingestion embeds every changed page inside the request.
+            timeout=INGEST_TIMEOUT_SECONDS,
             json={
                 "external_id": external_id,
                 "title": title,
@@ -154,6 +167,10 @@ class PermRAGClient:
     def list_documents(self) -> list[dict]:
         """Documents the *current* user may view, per SpiceDB."""
         return self._request("GET", "/documents")
+
+    def list_all_documents(self) -> list[dict]:
+        """Every live document, for admins managing access (admin only)."""
+        return self._request("GET", "/admin/documents")
 
     def get_document(self, document_id: str) -> dict:
         return self._request("GET", f"/documents/{document_id}")

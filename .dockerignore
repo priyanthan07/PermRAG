@@ -1,0 +1,13 @@
+# Keep the build context small and free of secrets: the Dockerfile copies
+# only what it names, but everything not listed here is sent to the builder.
+.env
+.env.*
+.venv
+.git
+**/__pycache__
+.pytest_cache
+.ruff_cache
+.mypy_cache
+tests
+ui
+docs
