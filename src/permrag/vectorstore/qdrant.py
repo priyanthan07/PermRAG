@@ -76,9 +76,32 @@ class QdrantVectorStore:
     # -- lifecycle ---------------------------------------------------------
 
     async def ensure_collection(self) -> None:
-        """Create the collection and payload indexes if absent. Idempotent."""
+        """
+            Create the collection and payload indexes if absent. Idempotent.
+
+            An existing collection must match the configured embedding width;
+            otherwise every question would fail at search time instead of here.
+        """
         try:
             exists = await self._client.collection_exists(self._collection)
+            stored_size = None
+            if exists:
+                info = await self._client.get_collection(self._collection)
+                vectors = info.config.params.vectors
+                stored_size = vectors.size if isinstance(vectors, models.VectorParams) else None
+        except Exception as exc:
+            raise VectorStoreError(f"Failed to prepare collection: {exc}") from exc
+
+        if stored_size is not None and stored_size != self._dimensions:
+            # Embeddings from different models cannot be compared even when
+            # the widths match, so this is never a matter of resizing.
+            raise VectorStoreError(
+                f"Collection '{self._collection}' holds {stored_size}-dim vectors, but the configured "
+                f"embedding model produces {self._dimensions}. Switch LLM_PROVIDER back to the provider "
+                "that built the index, or rebuild the collection with the new model."
+            )
+
+        try:
             if not exists:
                 await self._client.create_collection(
                     collection_name=self._collection,
@@ -104,6 +127,11 @@ class QdrantVectorStore:
 
     async def close(self) -> None:
         await self._client.close()
+
+    async def ping(self) -> None:
+        """Readiness probe: raises unless Qdrant answers and the collection exists."""
+        if not await self._client.collection_exists(self._collection):
+            raise VectorStoreError(f"Collection '{self._collection}' does not exist")
         
     # -- writes ------------------------------------------------------------
 
@@ -143,6 +171,35 @@ class QdrantVectorStore:
         )
         logger.info("document chunks deleted", extra={"document_id": document_id})
         
+    async def update_document_metadata(
+        self, document_id: str, title: str, source_uri: str | None, department_id: str
+    ) -> None:
+        """
+            Rewrite document-level fields on every chunk of a document.
+
+            A re-ingest only re-embeds changed pages; without this, chunks of
+            unchanged pages would keep citing the old title.
+        """
+        try:
+            await self._client.set_payload(
+                collection_name=self._collection,
+                payload={
+                    FIELD_TITLE: title,
+                    FIELD_SOURCE_URI: source_uri,
+                    FIELD_DEPARTMENT_ID: department_id,
+                },
+                points=models.FilterSelector(filter=self._document_filter(document_id)),
+                wait=True,
+            )
+        except Exception as exc:
+            raise VectorStoreError(f"Chunk metadata update failed: {exc}") from exc
+
+    @staticmethod
+    def _document_filter(document_id: str) -> models.Filter:
+        return models.Filter(
+            must=[models.FieldCondition(key=FIELD_DOCUMENT_ID, match=models.MatchValue(value=document_id))]
+        )
+
     async def delete_page(self, document_id: str, page_number: int) -> None:
         """Remove chunks for one page, ahead of re-embedding it."""
         await self._delete_by_filter(

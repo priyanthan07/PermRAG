@@ -8,8 +8,15 @@ from fastapi import APIRouter, Depends
 
 from permrag.api.deps import CurrentUser, get_answerer
 from permrag.api.schemas import ChatRequest, ChatResponse, CitationResponse
-from permrag.observability.langfuse_client import get_langfuse, observe_step
-from permrag.rag.answerer import Answerer
+from permrag.config import QUESTION_TOKEN_RESERVE, get_settings
+from permrag.exceptions import ValidationError
+from permrag.ingestion.chunker import count_tokens
+from permrag.observability.langfuse_client import (
+    get_langfuse,
+    get_trace_id,
+    observe_step,
+)
+from permrag.rag.answerer import Answerer, record_failed_query
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +36,16 @@ async def ask(
     The user id comes from the verified bearer token, never from the request
     body -- otherwise a caller could ask questions as somebody else.
     """
+    if get_settings().reranker_enabled:
+        # Chunks are sized so that chunk + question fits the reranker window.
+        # A longer question would make the reranker cut the passage short.
+        question_tokens = count_tokens(payload.question)
+        if question_tokens > QUESTION_TOKEN_RESERVE:
+            raise ValidationError(
+                f"Question is too long ({question_tokens} tokens; at most {QUESTION_TOKEN_RESERVE}). "
+                "Please shorten it."
+            )
+
     trace_attributes: AbstractContextManager[object] = nullcontext()
     if get_langfuse() is not None:
         from langfuse import propagate_attributes
@@ -37,7 +54,11 @@ async def ask(
 
     with trace_attributes:
         with observe_step("permrag-chat", input={"question": payload.question}) as span:
-            result = await answerer.answer(user_id=user.id, question=payload.question)
+            try:
+                result = await answerer.answer(user_id=user.id, question=payload.question)
+            except Exception as exc:
+                await record_failed_query(user.id, payload.question, exc, get_trace_id())
+                raise
             span.update(
                 output={
                     "answer": result.answer,
@@ -59,8 +80,8 @@ async def ask(
             for c in result.citations
         ],
         permitted_document_count=result.permitted_document_count,
+        permitted_documents_truncated=result.permitted_documents_truncated,
         retrieved_chunk_count=result.retrieved_chunk_count,
         trace_id=result.trace_id,
         latency_ms=result.latency_ms,
     )
-    

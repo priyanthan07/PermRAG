@@ -9,33 +9,63 @@ dependencies = [
     "asyncpg>=0.31.0",
     "authzed>=1.25.0",
     "bcrypt>=5.0.0",
-    "beautifulsoup4>=4.15.0",
     "deepeval>=4.2.3",
     "fastapi>=0.141.1",
     "google-genai>=2.22.0",
     "greenlet>=3.5.5",
     "httpx>=0.28.1",
     "langfuse>=4.15.1",
-    "mypy>=2.3.1",
     "openai>=3.8.0",
-    "openpyxl>=3.1.5",
     "psycopg[binary]>=3.3.5",
     "pydantic-settings>=2.15.0",
     "pydantic[email]>=2.13.5",
     "pyjwt>=2.13.0",
-    "pypdf>=6.18.1",
-    "pytest>=9.1.1",
-    "pytest-asyncio>=1.4.0",
-    "python-docx>=1.2.0",
     "python-multipart>=0.0.32",
-    "python-pptx>=1.0.2",
-    "qdrant-client>=1.19.0",
-    "ruff>=0.16.6",
+    # Pinned to the server's minor version (docker-compose: qdrant v1.13.1):
+    # the client refuses/warns across more than one minor version.
+    "qdrant-client>=1.13,<1.14",
     "sentence-transformers>=6.0.1",
     "sqlalchemy[asyncio]>=2.0.52",
-    "streamlit>=1.63.0",
+    # Listed directly (it comes with sentence-transformers) only so its index
+    # can be set below: the reranker runs on CPU, and the default Linux build
+    # pulls in several GB of CUDA libraries.
+    "torch>=2.14.0",
     "uvicorn[standard]>=0.52.4",
 ]
+
+# Not needed to run the API, so not in its image (Dockerfile: --no-default-groups).
+[dependency-groups]
+dev = [
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.6",
+]
+# The Streamlit console. File parsing happens here -- the API only receives
+# page text -- so the parsers belong to the UI (ui.Dockerfile: --only-group ui).
+ui = [
+    "beautifulsoup4>=4.15.0",
+    "httpx>=0.28.1",
+    "openpyxl>=3.1.5",
+    "pypdf>=6.18.1",
+    "python-docx>=1.2.0",
+    "python-pptx>=1.0.2",
+    "streamlit>=1.63.0",
+]
+
+[tool.uv]
+# Local `uv sync` / `uv run` install everything, so tests and the UI work.
+default-groups = ["dev", "ui"]
+
+# CPU-only torch on Linux (the Docker images). Other platforms keep the
+# default PyPI build.
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
 
 [build-system]
 requires = ["hatchling"]
@@ -47,5 +77,3 @@ packages = ["src/permrag"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
-
-

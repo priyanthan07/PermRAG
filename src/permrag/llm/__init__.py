@@ -9,7 +9,9 @@ lets the test suite patch these names without any live client existing.
 """
 
 from typing import Any
+
 from permrag.config import get_settings
+from permrag.exceptions import ConfigurationError
 
 
 def _provider():
@@ -21,6 +23,16 @@ def _provider():
     from permrag.llm import openai_client
 
     return openai_client
+
+
+def check_provider_credentials() -> None:
+    """Fail at startup, not on the first question, when the active provider has no key."""
+    settings = get_settings()
+    key = settings.gemini_api_key if settings.llm_provider == "gemini" else settings.openai_api_key
+    if key is None:
+        raise ConfigurationError(
+            f"LLM_PROVIDER is '{settings.llm_provider}' but {settings.llm_provider.upper()}_API_KEY is not set"
+        )
 
 
 def active_chat_model() -> str:
@@ -65,6 +77,7 @@ async def generate_answer(
 
 
 __all__ = [
+    "check_provider_credentials",
     "active_chat_model",
     "active_embedding_model",
     "embed_texts",

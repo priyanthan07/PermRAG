@@ -1,6 +1,7 @@
 
 from __future__ import annotations
 
+import codecs
 import csv
 import io
 from dataclasses import dataclass
@@ -59,13 +60,23 @@ def parse_file(filename: str, data: bytes) -> ParsedFile:
 
 
 def _decode(data: bytes) -> str:
-    """Best-effort decode. Replaces undecodable bytes rather than failing."""
-    for encoding in ("utf-8", "utf-16", "latin-1"):
+    """Decode text of unknown encoding.
+
+    UTF-16/32 only when a byte-order mark says so: without one, almost any
+    even-length byte string "decodes" as UTF-16 garbage. cp1252 (Windows)
+    comes before latin-1 because it maps 0x80-0x9F to real characters such as
+    the euro sign; latin-1 accepts every byte, so it is the last resort.
+    """
+    if data.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        return data.decode("utf-32")
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return data.decode("utf-16")
+    for encoding in ("utf-8-sig", "cp1252"):
         try:
             return data.decode(encoding)
-        except (UnicodeDecodeError, UnicodeError):
+        except UnicodeDecodeError:
             continue
-    return data.decode("utf-8", errors="replace")
+    return data.decode("latin-1")
 
 
 def _paginate(text: str, words_per_page: int = WORDS_PER_SYNTHETIC_PAGE) -> list[str]:
@@ -96,7 +107,13 @@ def _parse_pdf(data: bytes) -> ParsedFile:
 
     reader = PdfReader(io.BytesIO(data))
     raw = [(page.extract_text() or "") for page in reader.pages]
-    pages = _as_pages(raw)
+    # Keep each page's real number: renumbering around skipped blank pages
+    # would make citations point at the wrong page.
+    pages = [
+        {"page_number": number, "content": text.strip()}
+        for number, text in enumerate(raw, start=1)
+        if text.strip()
+    ]
 
     if not pages:
         raise EmptyDocument(
@@ -114,17 +131,22 @@ def _parse_pdf(data: bytes) -> ParsedFile:
 
 def _parse_docx(data: bytes) -> ParsedFile:
     import docx
+    from docx.table import Table
 
     document = docx.Document(io.BytesIO(data))
-    parts = [p.text for p in document.paragraphs if p.text.strip()]
+    parts = []
 
+    # Body order, so a table stays next to the paragraph that introduces it.
     # Tables carry real content in most business documents; losing them
     # silently would make the answers wrong rather than merely incomplete.
-    for table in document.tables:
-        for row in table.rows:
-            cells = [c.text.strip() for c in row.cells if c.text.strip()]
-            if cells:
-                parts.append(" | ".join(cells))
+    for block in document.iter_inner_content():
+        if isinstance(block, Table):
+            for row in block.rows:
+                cells = [c.text.strip() for c in row.cells if c.text.strip()]
+                if cells:
+                    parts.append(" | ".join(cells))
+        elif block.text.strip():
+            parts.append(block.text)
 
     text = "\n".join(parts)
     pages = _as_pages(_paginate(text))

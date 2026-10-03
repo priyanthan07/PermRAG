@@ -23,6 +23,7 @@ from permrag.api.schemas import (
     ShareWithDepartmentRequest,
     ShareWithUserRequest,
 )
+from permrag.config import get_settings
 from permrag.db.models import Department, Document
 from permrag.exceptions import NotFoundError
 from permrag.ingestion.pipeline import IngestionPipeline, PageInput
@@ -91,7 +92,9 @@ async def list_visible_documents(
     The id set comes from SpiceDB; Postgres is used only to hydrate titles and
     metadata for ids already cleared by the permission system.
     """
-    permitted_ids, _ = await permissions.list_viewable_document_ids(user.id, limit=5000)
+    permitted_ids, _ = await permissions.list_viewable_document_ids(
+        user.id, limit=get_settings().max_permitted_documents
+    )
     if not permitted_ids:
         return []
 

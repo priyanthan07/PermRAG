@@ -32,6 +32,14 @@ def make_hit(chunk_id: str, document_id: str) -> SearchHit:
     )
 
 
+@pytest.fixture(autouse=True)
+def no_reranker_model():
+    """These are permission assertions; they must not depend on how a model
+    scores dummy text. Without a model the reranker keeps embedding order."""
+    with patch("permrag.rag.reranker._load_encoder", return_value=None):
+        yield
+
+
 @pytest.fixture
 def patched_embed():
     with patch(

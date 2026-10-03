@@ -21,7 +21,7 @@ from authzed.api.v1 import (
     WriteSchemaRequest,
     ZedToken,
 )
-from grpcutil import bearer_token_credentials, insecure_bearer_token_credentials
+from grpcutil import bearer_token_credentials
 
 from permrag.config import get_settings
 from permrag.exceptions import PermissionSystemError
@@ -81,6 +81,21 @@ def user_subject(user_id: str) -> SubjectReference:
     return SubjectReference(object=ObjectReference(object_type=TYPE_USER, object_id=user_id))
 
 
+class _PlaintextClient(Client):
+    """
+        The authzed client over a plaintext async channel.
+
+        gRPC's "insecure + token" credentials refuse any address that is not
+        loopback, so they fail inside docker-compose (SpiceDB at spicedb:50051).
+        authzed's own InsecureClient avoids that but builds a synchronous
+        channel, while every call here is awaited.
+    """
+
+    def __init__(self, target: str) -> None:
+        # init_stubs exists at runtime (authzed Client) but is missing from its .pyi stubs.
+        self.init_stubs(grpc.aio.insecure_channel(target))  # type: ignore[attr-defined]
+
+
 class SpiceDBClient:
     """Async SpiceDB client. One instance per process, shared by all requests."""
 
@@ -89,14 +104,19 @@ class SpiceDBClient:
         token = settings.spicedb_token.get_secret_value()
 
         if settings.spicedb_insecure:
-            credentials = insecure_bearer_token_credentials(token)
+            # No TLS: the preshared key travels as call metadata, the same
+            # header token credentials would add.
+            self._client: Client = _PlaintextClient(settings.spicedb_endpoint)
+            self._metadata: tuple[tuple[str, str], ...] | None = (("authorization", f"Bearer {token}"),)
         else:
-            credentials = bearer_token_credentials(token)
-
-        # Client auto-selects the asyncio channel because it is constructed
-        # inside a running event loop (the FastAPI lifespan hook).
-        self._client = Client(settings.spicedb_endpoint, credentials)
+            # Client auto-selects the asyncio channel because it is constructed
+            # inside a running event loop (the FastAPI lifespan hook).
+            self._client = Client(settings.spicedb_endpoint, bearer_token_credentials(token))
+            self._metadata = None
         self._endpoint = settings.spicedb_endpoint
+        # Passed on every call; an expired deadline raises grpc.RpcError, which
+        # becomes PermissionSystemError -- so a hung SpiceDB fails closed.
+        self._timeout = settings.spicedb_timeout_seconds
         logger.info("spicedb client initialised", extra={"endpoint": self._endpoint})
 
     # -- schema ------------------------------------------------------------
@@ -104,7 +124,7 @@ class SpiceDBClient:
     async def write_schema(self, schema_text: str) -> None:
         """Apply the .zed schema. Idempotent; safe to call on every startup."""
         try:
-            await self._client.WriteSchema(WriteSchemaRequest(schema=schema_text))
+            await self._client.WriteSchema(WriteSchemaRequest(schema=schema_text), timeout=self._timeout, metadata=self._metadata)
             logger.info("spicedb schema applied")
         except grpc.RpcError as exc:
             raise PermissionSystemError(f"Failed to write schema: {exc}") from exc
@@ -143,7 +163,7 @@ class SpiceDBClient:
 
         try:
             response = await self._client.WriteRelationships(
-                WriteRelationshipsRequest(updates=updates)
+                WriteRelationshipsRequest(updates=updates), timeout=self._timeout, metadata=self._metadata
             )
         except grpc.RpcError as exc:
             raise PermissionSystemError(f"Relationship write failed: {exc}") from exc
@@ -183,7 +203,7 @@ class SpiceDBClient:
 
         try:
             response = await self._client.DeleteRelationships(
-                DeleteRelationshipsRequest(relationship_filter=rel_filter)
+                DeleteRelationshipsRequest(relationship_filter=rel_filter), timeout=self._timeout, metadata=self._metadata
             )
         except grpc.RpcError as exc:
             raise PermissionSystemError(f"Relationship delete failed: {exc}") from exc
@@ -258,7 +278,7 @@ class SpiceDBClient:
                 received = 0
                 next_cursor: Cursor | None = None
 
-                async for response in self._client.LookupResources(request):
+                async for response in self._client.LookupResources(request, timeout=self._timeout, metadata=self._metadata):
                     received += 1
                     document_id = response.resource_object_id
                     if document_id not in seen and len(document_ids) < limit:
@@ -308,7 +328,7 @@ class SpiceDBClient:
             subject=user_subject(user_id),
         )
         try:
-            response = await self._client.CheckPermission(request)
+            response = await self._client.CheckPermission(request, timeout=self._timeout, metadata=self._metadata)
         except grpc.RpcError as exc:
             raise PermissionSystemError(f"Permission check failed: {exc}") from exc
 
@@ -336,7 +356,7 @@ class SpiceDBClient:
 
         results: list[RelationshipTuple] = []
         try:
-            async for response in self._client.ReadRelationships(request):
+            async for response in self._client.ReadRelationships(request, timeout=self._timeout, metadata=self._metadata):
                 rel = response.relationship
                 results.append(
                     RelationshipTuple(

@@ -33,6 +33,29 @@ from permrag.config import get_settings
 logger = logging.getLogger(__name__)
 
 _judge_cache: Any = None
+_judge_missing_key_logged = False
+
+
+def _judge_available(settings) -> bool:
+    """
+        The judge needs its own provider's key (it can differ from the answering
+        provider). Without one every evaluation would fail; say so once and skip.
+    """
+    global _judge_missing_key_logged
+
+    needs_gemini = settings.eval_judge_model.startswith("gemini")
+    if (settings.gemini_api_key if needs_gemini else settings.openai_api_key) is not None:
+        return True
+    if not _judge_missing_key_logged:
+        logger.warning(
+            "evaluation skipped: no API key for the judge model",
+            extra={
+                "judge_model": settings.eval_judge_model,
+                "needs": "GEMINI_API_KEY" if needs_gemini else "OPENAI_API_KEY",
+            },
+        )
+        _judge_missing_key_logged = True
+    return False
 
 
 @dataclass(slots=True)
@@ -140,7 +163,7 @@ async def evaluate_response(
     """
     settings = get_settings()
 
-    if not settings.eval_enabled:
+    if not settings.eval_enabled or not _judge_available(settings):
         return EvalScores()
 
     if not retrieval_context:

@@ -1,6 +1,9 @@
 import uuid
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
+
+from permrag.security.passwords import MAX_PASSWORD_BYTES
 
 # --- auth ------------------
 
@@ -56,6 +59,15 @@ class UserCreate(BaseModel):
     full_name: str = Field(min_length=1, max_length=255)
     password: str = Field(min_length=8, max_length=72)
     is_admin: bool = False
+
+    @field_validator("password")
+    @classmethod
+    def _fits_bcrypt(cls, value: str) -> str:
+        # max_length counts characters; bcrypt's limit is 72 *bytes*, and a
+        # non-ASCII character takes 2-4 bytes in UTF-8.
+        if len(value.encode("utf-8")) > MAX_PASSWORD_BYTES:
+            raise ValueError(f"Password must be at most {MAX_PASSWORD_BYTES} bytes once UTF-8 encoded")
+        return value
 
 
 class UserResponse(BaseModel):
@@ -168,6 +180,9 @@ class ChatResponse(BaseModel):
     answer: str
     citations: list[CitationResponse]
     permitted_document_count: int
+    # True when the user can see more documents than MAX_PERMITTED_DOCUMENTS;
+    # the ones past the cap were not searched.
+    permitted_documents_truncated: bool = False
     retrieved_chunk_count: int
     trace_id: str | None
     latency_ms: int

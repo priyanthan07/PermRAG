@@ -139,6 +139,12 @@ async def generate_answer(
         raise LLMError(f"Chat completion failed: {exc}") from exc
 
     answer = response.text or ""
+    if not answer.strip():
+        # A blocked response, or one whose output budget ran out, has no text.
+        # Returning "" would look like a successful, empty answer.
+        finish_reason = response.candidates[0].finish_reason if response.candidates else None
+        logger.warning("model returned no answer text", extra={"finish_reason": str(finish_reason)})
+        raise LLMError(f"Model returned no answer text (finish_reason={finish_reason})")
 
     usage: dict[str, Any] = {}
     meta = response.usage_metadata

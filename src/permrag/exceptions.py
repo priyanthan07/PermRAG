@@ -39,6 +39,11 @@ class ValidationError(PermRAGError):
     detail = "Request failed validation"
 
 
+class TooManyRequestsError(PermRAGError):
+    status_code = 429
+    detail = "Too many attempts; try again later"
+
+
 class PermissionSystemError(PermRAGError):
     """SpiceDB was unreachable or returned an error.
 

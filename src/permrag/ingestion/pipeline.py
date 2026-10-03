@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from permrag.config import get_settings
 from permrag.db.models import Document, DocumentPage, DocumentShare
+from permrag.db.session import session_scope
 from permrag.exceptions import (
     ConflictError,
     NotFoundError,
@@ -64,32 +65,37 @@ class IngestionPipeline:
         if len(numbers) != len(set(numbers)):
             raise ValidationError("Duplicate page numbers in payload")
 
-        document = await self._get_or_create_document(
+        document, is_new, metadata_changed = await self._get_or_create_document(
             external_id=external_id,
             title=title,
             owner_department_id=owner_department_id,
             source_uri=source_uri,
             transfer_ownership=transfer_ownership,
         )
+        document_id = document.id
 
         document.status = "indexing"
         document.error_message = None
         await self._session.flush()
 
-        # Step 2: permission edge before any content becomes searchable.
-        await self._permissions.set_document_owner(
-            document_id=document.id,
-            department_id=owner_department_id,
-            actor_id=actor_id,
-        )
-
         try:
             result = await self._sync_pages(document, pages)
+            if metadata_changed and not is_new:
+                await self._store.update_document_metadata(
+                    str(document_id), title, source_uri, str(owner_department_id)
+                )
+            # The ownership edge goes last. Until the document row commits and
+            # this edge exists, none of its chunks is in anyone's permitted set,
+            # so writing content first never exposes it -- and a failure above
+            # leaves the permission graph untouched (including on a transfer).
+            await self._permissions.set_document_owner(
+                document_id=document_id,
+                department_id=owner_department_id,
+                actor_id=actor_id,
+            )
         except Exception as exc:
-            document.status = "failed"
-            document.error_message = str(exc)[:2000]
-            await self._session.flush()
-            logger.exception("ingestion failed", extra={"document_id": str(document.id)})
+            logger.exception("ingestion failed", extra={"document_id": str(document_id)})
+            await self._record_failure(document_id, is_new, exc)
             raise
 
         document.status = "indexed"
@@ -115,7 +121,8 @@ class IngestionPipeline:
         owner_department_id: uuid.UUID,
         source_uri: str | None,
         transfer_ownership: bool,
-    ) -> Document:
+    ) -> tuple[Document, bool, bool]:
+        """Returns (document, is_new, metadata_changed)."""
         existing = await self._session.execute(
             select(Document).where(Document.external_id == external_id)
         )
@@ -145,12 +152,45 @@ class IngestionPipeline:
             )
             self._session.add(document)
             await self._session.flush()
-        else:
-            document.title = title
-            document.source_uri = source_uri
-            document.owner_department_id = owner_department_id
+            return document, True, False
 
-        return document
+        metadata_changed = (
+            document.title != title
+            or document.source_uri != source_uri
+            or document.owner_department_id != owner_department_id
+        )
+        document.title = title
+        document.source_uri = source_uri
+        document.owner_department_id = owner_department_id
+        return document, False, metadata_changed
+
+    async def _record_failure(self, document_id: uuid.UUID, is_new: bool, exc: Exception) -> None:
+        """
+            Leave a failed ingest in a known state.
+
+            The request's transaction is rolled back first: it holds the lock on
+            the document row, which the failure record below writes from a
+            separate transaction (the request's own changes never commit).
+        """
+        await self._session.rollback()
+
+        if is_new:
+            # The row never committed and no ownership edge was written, so
+            # chunks already stored are unreachable. Remove them anyway.
+            try:
+                await self._store.delete_document(str(document_id))
+            except VectorStoreError:
+                logger.error(
+                    "chunks of a failed new document could not be removed; they are unreachable",
+                    extra={"document_id": str(document_id)},
+                )
+            return
+
+        async with session_scope() as session:
+            row = await session.get(Document, document_id)
+            if row is not None:
+                row.status = "failed"
+                row.error_message = str(exc)[:2000]
     
     async def _sync_pages(self, document: Document, pages: list[PageInput]) -> IngestionResult:
         existing_result = await self._session.execute(
@@ -161,13 +201,6 @@ class IngestionPipeline:
 
         indexed = skipped = removed = chunks_written = 0
         fingerprint = chunking_fingerprint()
-
-        # Pages gone from the source: drop their chunks and their rows.
-        for page_number, page_row in existing_pages.items():
-            if page_number not in incoming_numbers:
-                await self._store.delete_page(str(document.id), page_number)
-                await self._session.delete(page_row)
-                removed += 1
 
         for page in pages:
             content_hash = hash_content(page.content, fingerprint)
@@ -180,6 +213,14 @@ class IngestionPipeline:
             written = await self._index_page(document, page, content_hash, existing_page)
             chunks_written += written
             indexed += 1
+
+        # Pages gone from the source: drop their chunks and their rows. Done
+        # only after every page indexed, so a failure above leaves them intact.
+        for page_number, page_row in existing_pages.items():
+            if page_number not in incoming_numbers:
+                await self._store.delete_page(str(document.id), page_number)
+                await self._session.delete(page_row)
+                removed += 1
 
         await self._session.flush()
 
@@ -205,15 +246,14 @@ class IngestionPipeline:
             overlap_tokens=self._settings.chunk_overlap_tokens,
         )
 
-        # Clear the old chunks first. Chunk ids are deterministic, so a page
-        # that shrank would otherwise leave stale trailing chunks behind.
-        await self._store.delete_page(str(document.id), page.page_number)
-
         if not chunks:
+            await self._store.delete_page(str(document.id), page.page_number)
             self._upsert_page_row(document, page, content_hash, 0, existing_page)
             return 0
 
         version = (existing_page.version + 1) if existing_page else 1
+        # Embed before touching the index: if the embedding call fails, the
+        # page's current chunks stay in place and searchable.
         vectors = await embed_texts([c.text for c in chunks])
 
         payloads = [
@@ -231,6 +271,9 @@ class IngestionPipeline:
             for c in chunks
         ]
 
+        # Then replace. Old chunks go first: chunk ids are deterministic, so a
+        # page that shrank would otherwise keep stale trailing chunks.
+        await self._store.delete_page(str(document.id), page.page_number)
         await self._store.upsert_chunks(payloads, vectors)
         self._upsert_page_row(document, page, content_hash, len(chunks), existing_page, version)
         return len(chunks)

@@ -14,6 +14,8 @@ def get_openai_client() -> AsyncOpenAI:
     global _client
     if _client is None:
         settings = get_settings()
+        if settings.openai_api_key is None:
+            raise LLMError("LLM_PROVIDER is 'openai' but OPENAI_API_KEY is not set")
         _client = AsyncOpenAI(
             api_key=settings.openai_api_key.get_secret_value(),
             timeout=settings.openai_timeout_seconds,
@@ -74,6 +76,11 @@ async def generate_answer(
 
     choice = response.choices[0]
     answer = choice.message.content or ""
+    if not answer.strip():
+        # A refusal or a hit output limit can come back with no text.
+        # Returning "" would look like a successful, empty answer.
+        logger.warning("model returned no answer text", extra={"finish_reason": choice.finish_reason})
+        raise LLMError(f"Model returned no answer text (finish_reason={choice.finish_reason})")
 
     usage: dict[str, Any] = {}
     if response.usage is not None:

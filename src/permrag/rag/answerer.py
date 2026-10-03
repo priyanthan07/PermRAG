@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -7,6 +8,7 @@ from datetime import UTC, datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from permrag.db.models import QueryLog
+from permrag.db.session import session_scope
 from permrag.evaluation.evaluator import evaluate_response, push_scores_to_langfuse
 from permrag.llm import active_chat_model, generate_answer
 from permrag.observability.langfuse_client import get_trace_id, observe_step
@@ -20,6 +22,14 @@ ANSWER_MAX_TOKENS = 900
 
 # Fire-and-forget evaluation tasks still in flight.
 _background_tasks: set[asyncio.Task[None]] = set()
+
+# Each evaluation makes several judge-model calls. Cap how many run at once so
+# a burst of questions cannot turn into a burst of judge requests.
+EVAL_CONCURRENCY = 4
+_eval_slots = asyncio.Semaphore(EVAL_CONCURRENCY)
+
+# Citation markers the model writes: [1], [2], or grouped as [1, 3].
+_CITATION = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
 
 SYSTEM_PROMPT = """
     You are an internal knowledge assistant for a large organization.
@@ -55,7 +65,45 @@ class AnswerResult:
     retrieved_chunk_count: int
     trace_id: str | None
     latency_ms: int
-    
+    permitted_documents_truncated: bool = False
+
+
+def cited_indices(answer: str) -> set[int]:
+    """Passage numbers the answer cites."""
+    return {int(n) for group in _CITATION.findall(answer) for n in group.split(",")}
+
+
+async def drain_background_tasks(timeout: float = 30.0) -> None:
+    """Wait, bounded, for in-flight evaluations so shutdown does not drop their scores."""
+    if not _background_tasks:
+        return
+    _, pending = await asyncio.wait(set(_background_tasks), timeout=timeout)
+    if pending:
+        logger.warning("evaluations still running at shutdown were dropped", extra={"count": len(pending)})
+
+
+async def record_failed_query(user_id: uuid.UUID, question: str, error: Exception, trace_id: str | None) -> None:
+    """
+        Log a question that failed, in its own transaction.
+
+        The request's transaction rolls back on error, so without this a failed
+        question would leave no row at all.
+    """
+    try:
+        async with session_scope() as session:
+            session.add(
+                QueryLog(
+                    created_at=datetime.now(UTC),
+                    user_id=user_id,
+                    question=question,
+                    error=f"{type(error).__name__}: {error}"[:2000],
+                    trace_id=trace_id,
+                )
+            )
+    except Exception:
+        logger.exception("could not record a failed query", extra={"user_id": str(user_id)})
+
+
 def build_context(hits: list[SearchHit]) -> tuple[str, list[Citation]]:
     blocks: list[str] = []
     citations: list[Citation] = []
@@ -96,6 +144,7 @@ class Answerer:
                 retrieved_chunk_count=0,
                 trace_id=get_trace_id(),
                 latency_ms=self._elapsed_ms(started),
+                permitted_documents_truncated=retrieval.truncated,
             )
             await self._log_query(user_id, question, retrieval, result)
             return result
@@ -119,13 +168,19 @@ class Answerer:
             span.update(output=answer_text, usage_details=usage)
             trace_id = get_trace_id()
 
+        # Only the passages the answer actually cites. If it cites none, keep
+        # them all so the user can still see what the answer was drawn from.
+        cited = cited_indices(answer_text)
+        shown = [c for c in citations if c.index in cited] or citations
+
         result = AnswerResult(
             answer=answer_text,
-            citations=citations,
+            citations=shown,
             permitted_document_count=len(retrieval.permitted_document_ids),
             retrieved_chunk_count=len(retrieval.hits),
             trace_id=trace_id,
             latency_ms=self._elapsed_ms(started),
+            permitted_documents_truncated=retrieval.truncated,
         )
         await self._log_query(user_id, question, retrieval, result)
 
@@ -158,7 +213,8 @@ class Answerer:
         never surfaced to the user or allowed to affect the response.
         """
         try:
-            scores = await evaluate_response(question, answer, retrieval_context)
+            async with _eval_slots:
+                scores = await evaluate_response(question, answer, retrieval_context)
             if scores.error:
                 logger.warning("eval returned an error", extra={"error": scores.error})
                 return

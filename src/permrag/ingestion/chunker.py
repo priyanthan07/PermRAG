@@ -36,6 +36,11 @@ def get_tokenizer() -> Any:
     return AutoTokenizer.from_pretrained(get_settings().reranker_model)
 
 
+def count_tokens(text: str) -> int:
+    """Length of ``text`` in the reranker's tokens, without special tokens."""
+    return len(get_tokenizer()(text, add_special_tokens=False, verbose=False)["input_ids"])
+
+
 def chunking_fingerprint() -> str:
     """
         Identifies how pages are chunked. Part of every page hash, so changing

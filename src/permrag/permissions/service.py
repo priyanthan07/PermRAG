@@ -3,7 +3,7 @@ import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -169,24 +169,16 @@ class PermissionService:
         await self._require_active_user(user_id)
         await self._require_department(department_id)
 
-        existing = await self._session.execute(
-            select(UserDepartment).where(
-                UserDepartment.user_id == user_id,
-                UserDepartment.department_id == department_id,
+        # Atomic upsert: two concurrent grants for the same pair must not both
+        # try to insert (unique constraint) and fail one request with a 500.
+        await self._session.execute(
+            pg_insert(UserDepartment)
+            .values(user_id=user_id, department_id=department_id, is_manager=is_manager, granted_by_id=actor_id)
+            .on_conflict_do_update(
+                index_elements=["user_id", "department_id"],
+                set_={"is_manager": is_manager, "updated_at": func.now()},
             )
         )
-        row = existing.scalar_one_or_none()
-        if row is None:
-            self._session.add(
-                UserDepartment(
-                    user_id=user_id,
-                    department_id=department_id,
-                    is_manager=is_manager,
-                    granted_by_id=actor_id,
-                )
-            )
-        else:
-            row.is_manager = is_manager
 
         await self._audit(
             actor_id,
@@ -238,9 +230,10 @@ class PermissionService:
     ) -> str:
         """Bind a document to its single owning department.
 
-        Called during ingestion *before* any chunk is written to the vector
-        store, so a chunk is never searchable before its ownership edge exists.
-        Any previous owner's edge is removed in the same atomic write.
+        Called at the end of a successful ingest. Chunks are never searchable
+        before this edge exists: a document is only in a permitted set once it
+        has an edge and a committed row. Any previous owner's edge is removed
+        in the same atomic write.
         """
         await self._audit(
             actor_id,
@@ -300,21 +293,11 @@ class PermissionService:
         await self._require_live_document(document_id)
         await self._require_department(department_id)
 
-        existing = await self._session.execute(
-            select(DocumentShare).where(
-                DocumentShare.document_id == document_id,
-                DocumentShare.department_id == department_id,
-            )
+        await self._session.execute(
+            pg_insert(DocumentShare)
+            .values(document_id=document_id, department_id=department_id, granted_by_id=actor_id, reason=reason)
+            .on_conflict_do_nothing(index_elements=["document_id", "department_id"])
         )
-        if existing.scalar_one_or_none() is None:
-            self._session.add(
-                DocumentShare(
-                    document_id=document_id,
-                    department_id=department_id,
-                    granted_by_id=actor_id,
-                    reason=reason,
-                )
-            )
 
         await self._audit(
             actor_id,
@@ -363,21 +346,11 @@ class PermissionService:
         await self._require_live_document(document_id)
         await self._require_active_user(user_id)
 
-        existing = await self._session.execute(
-            select(DocumentShare).where(
-                DocumentShare.document_id == document_id,
-                DocumentShare.user_id == user_id,
-            )
+        await self._session.execute(
+            pg_insert(DocumentShare)
+            .values(document_id=document_id, user_id=user_id, granted_by_id=actor_id, reason=reason)
+            .on_conflict_do_nothing(index_elements=["document_id", "user_id"])
         )
-        if existing.scalar_one_or_none() is None:
-            self._session.add(
-                DocumentShare(
-                    document_id=document_id,
-                    user_id=user_id,
-                    granted_by_id=actor_id,
-                    reason=reason,
-                )
-            )
 
         await self._audit(
             actor_id,
@@ -453,6 +426,16 @@ class PermissionService:
         return await self._write_and_checkpoint(purge)
 
     # -- reads --------------------------------------------------------------
+
+    async def end_transaction(self) -> None:
+        """
+            End the current transaction and return its pooled connection.
+
+            For read paths that go on to slow, database-free work (embedding,
+            search, the LLM call): holding the connection meanwhile would cap
+            concurrent requests at the pool size.
+        """
+        await self._session.commit()
 
     async def list_viewable_document_ids(
         self, user_id: uuid.UUID, limit: int

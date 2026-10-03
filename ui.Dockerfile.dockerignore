@@ -1,0 +1,7 @@
+# Build context for ui.Dockerfile (BuildKit uses <Dockerfile>.dockerignore
+# instead of .dockerignore). Only pyproject.toml, uv.lock and ui/ are needed.
+*
+!pyproject.toml
+!uv.lock
+!ui/
+ui/__pycache__

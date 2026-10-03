@@ -1,11 +1,13 @@
 from functools import lru_cache
 from typing import Literal
+from urllib.parse import urlparse
 
 from pydantic import Field, PostgresDsn, SecretStr, computed_field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Reranker tokens kept free for the question when sizing chunks (~45 words).
-QUESTION_TOKEN_RESERVE = 64
+# Reranker tokens reserved for the question when sizing chunks (~70 words).
+# /chat rejects longer questions, so the reserve is a guarantee, not a guess.
+QUESTION_TOKEN_RESERVE = 100
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -39,6 +41,10 @@ class Settings(BaseSettings):
     spicedb_endpoint: str = "localhost:50051"
     spicedb_token: SecretStr = SecretStr("permrag-local-dev-key")
     spicedb_insecure: bool = True
+    # Deadline for every SpiceDB call (a streamed lookup counts as one call).
+    # Without one, a hung server blocks chat indefinitely and a hung write
+    # holds the checkpoint lock, queueing every permission change behind it.
+    spicedb_timeout_seconds: float = Field(default=10.0, gt=0)
     
     # --- Qdrant ---
     qdrant_url: str = "http://localhost:6333"
@@ -107,8 +113,9 @@ class Settings(BaseSettings):
     # Measured in reranker tokens (see ingestion/chunker.py). The reranker reads
     # [CLS] question [SEP] chunk [SEP] within reranker_max_length, so a chunk
     # may use at most reranker_max_length - 3 - QUESTION_TOKEN_RESERVE tokens
-    # (445 at the defaults). 400 leaves headroom; the 60-token overlap (15%)
-    # keeps a sentence cut at a boundary whole in one of the two chunks.
+    # (409 at the defaults); 400 fits under that. The 60-token overlap (15%)
+    # is above the measured 95th-percentile sentence length (47 tokens), so a
+    # sentence cut at a boundary stays whole in one of the two chunks.
     chunk_size_tokens: int = Field(default=400, ge=32)
     chunk_overlap_tokens: int = Field(default=60, ge=0)
 
@@ -124,6 +131,25 @@ class Settings(BaseSettings):
                 f"CHUNK_SIZE_TOKENS={self.chunk_size_tokens} does not fit the reranker window: "
                 f"at most {budget} ({self.reranker_max_length} - 3 special tokens - "
                 f"{QUESTION_TOKEN_RESERVE} reserved for the question)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_transport_security(self) -> "Settings":
+        url = urlparse(self.qdrant_url)
+        # A single-label host (e.g. "qdrant" in docker-compose) is only
+        # resolvable inside a private network; anything with a dot may cross
+        # one, so it must use TLS when a key is sent.
+        internal_host = url.hostname is not None and "." not in url.hostname
+        if (
+            self.environment != "local"
+            and self.qdrant_api_key
+            and url.scheme == "http"
+            and not internal_host
+        ):
+            raise ValueError(
+                "QDRANT_API_KEY would be sent unencrypted over http:// to an external host; "
+                "use an https:// QDRANT_URL outside ENVIRONMENT=local"
             )
         return self
 

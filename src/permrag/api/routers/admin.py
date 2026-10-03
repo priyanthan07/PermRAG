@@ -1,20 +1,23 @@
+import asyncio
 import logging
 import uuid
 
 from fastapi import APIRouter, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 
 from permrag.api.deps import AdminUser, DbSession, PermissionServiceDep
 from permrag.api.schemas import (
     DepartmentCreate,
     DepartmentResponse,
+    DocumentResponse,
     MembershipRequest,
     MembershipResponse,
     MessageResponse,
     UserCreate,
     UserResponse,
 )
-from permrag.db.models import Department, User, UserDepartment
+from permrag.db.models import Department, Document, User, UserDepartment
 from permrag.exceptions import ConflictError, NotFoundError
 from permrag.security.passwords import hash_password
 
@@ -44,10 +47,28 @@ async def create_department(
         description=payload.description,
     )
     session.add(department)
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        # A concurrent request created the same slug after the check above.
+        raise ConflictError(f"Department '{payload.slug}' already exists") from exc
 
     logger.info("department created", extra={"department_id": str(department.id)})
     return department
+
+@router.get("/documents", response_model=list[DocumentResponse])
+async def list_all_documents(session: DbSession, _: AdminUser) -> list[Document]:
+    """Every live document, for managing access.
+
+    Unlike GET /documents this does not depend on the admin's own permissions:
+    an admin must be able to share a document they cannot read themselves.
+    Titles and ids only -- content is still reached through retrieval alone.
+    """
+    result = await session.execute(
+        select(Document).where(Document.status != "deleted").order_by(Document.title)
+    )
+    return list(result.scalars().all())
+
 
 @router.get("/departments", response_model=list[DepartmentResponse])
 async def list_departments(session: DbSession, _: AdminUser) -> list[Department]:
@@ -70,12 +91,17 @@ async def create_user(
     user = User(
         email=email,
         full_name=payload.full_name,
-        hashed_password=hash_password(payload.password),
+        # bcrypt is deliberately slow CPU work: keep it off the event loop.
+        hashed_password=await asyncio.to_thread(hash_password, payload.password),
         is_admin=payload.is_admin,
         is_active=True,
     )
     session.add(user)
-    await session.flush()
+    try:
+        await session.flush()
+    except IntegrityError as exc:
+        # A concurrent request created the same email after the check above.
+        raise ConflictError(f"User '{email}' already exists") from exc
 
     logger.info("user provisioned", extra={"user_id": str(user.id)})
     return user

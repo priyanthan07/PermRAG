@@ -48,6 +48,11 @@ class PermissionAwareRetriever:
             permitted_ids, zed_token = await self._lookup(user_id, max_docs)
             span.update(output={"permitted_document_count": len(permitted_ids)})
 
+        # The permission reads are the last database work until the query is
+        # logged, so don't hold a pooled connection through embedding, search,
+        # reranking and the LLM call.
+        await self._permissions.end_transaction()
+
         truncated = len(permitted_ids) >= max_docs
         if truncated:
             # The filter would silently omit documents beyond the cap, which
